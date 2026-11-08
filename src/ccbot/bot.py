@@ -186,6 +186,39 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     clear_browse_state(context.user_data)
 
+    # In an unbound topic, open the picker straight away (nothing to forward after binding)
+    thread_id = _get_thread_id(update)
+    if (
+        update.message
+        and thread_id is not None
+        and session_manager.get_window_for_thread(user.id, thread_id) is None
+    ):
+        all_windows = await tmux_manager.list_windows()
+        bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
+        unbound = [
+            (w.window_id, w.window_name, w.cwd)
+            for w in all_windows
+            if w.window_id not in bound_ids
+        ]
+        if unbound:
+            msg_text, keyboard, win_ids = build_window_picker(unbound)
+            if context.user_data is not None:
+                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
+        else:
+            start_path = str(Path.cwd())
+            msg_text, keyboard, subdirs = build_directory_browser(start_path)
+            if context.user_data is not None:
+                context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+                context.user_data[BROWSE_PATH_KEY] = start_path
+                context.user_data[BROWSE_PAGE_KEY] = 0
+                context.user_data[BROWSE_DIRS_KEY] = subdirs
+        if context.user_data is not None:
+            context.user_data["_pending_thread_id"] = thread_id
+            context.user_data.pop("_pending_thread_text", None)
+        await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        return
+
     if update.message:
         await safe_reply(
             update.message,
