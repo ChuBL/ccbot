@@ -17,7 +17,9 @@ Key components:
 """
 
 import asyncio
+import html
 import logging
+import re
 import time
 
 from telegram import Bot
@@ -41,6 +43,48 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+
+# Local patch: pass on the "claude --resume" line Claude Code prints when it quits.
+# Anchored to the start of a line because the same words can be quoted inside a conversation.
+# Claude Code repeats the flags it was launched with ahead of --resume.
+_RE_RESUME_LINE = re.compile(
+    r"^\s*Resume this session with:[ \t]*\n\s*"
+    r"(claude\b[^\n]*--resume\s+[0-9a-fA-F-]{36}[^\n]*?)[ \t]*$",
+    re.MULTILINE,
+)
+_SHELLS = frozenset({"zsh", "bash", "sh", "dash", "fish"})
+# window_id -> resume command already handled ("" while something other than a shell runs)
+_resume_seen: dict[str, str] = {}
+
+
+async def _forward_resume_line(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    thread_id: int | None,
+    pane_command: str,
+    pane_text: str,
+) -> None:
+    """Send the resume command to the topic once per exit."""
+    if pane_command not in _SHELLS:
+        _resume_seen[window_id] = ""
+        return
+    found = _RE_RESUME_LINE.findall(pane_text)
+    command = found[-1] if found else ""
+    if window_id not in _resume_seen:
+        # First look at this window (e.g. the bot restarted): old text, not a new exit
+        _resume_seen[window_id] = command
+        return
+    if not command or command == _resume_seen[window_id]:
+        return
+    thread_kwargs = {} if thread_id is None else {"message_thread_id": thread_id}
+    await bot.send_message(
+        chat_id=session_manager.resolve_chat_id(user_id, thread_id),
+        text=f"Resume this session with:\n<code>{html.escape(command)}</code>",
+        parse_mode="HTML",
+        **thread_kwargs,  # type: ignore[arg-type]
+    )
+    _resume_seen[window_id] = command
 
 
 async def update_status_message(
@@ -72,6 +116,10 @@ async def update_status_message(
     if not pane_text:
         # Transient capture failure - keep existing status message
         return
+
+    await _forward_resume_line(
+        bot, user_id, window_id, thread_id, w.pane_current_command, pane_text
+    )
 
     interactive_window = get_interactive_window(user_id, thread_id)
     should_check_new_ui = True
