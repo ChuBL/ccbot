@@ -263,3 +263,29 @@ class TestExtractBashOutput:
         result = extract_bash_output(pane, "echo hi")
         assert result is not None
         assert not result.endswith("\n")
+
+
+class TestAgentView:
+    PANE = (
+        "  ▐▛███▜▌ Claude Code\n"
+        "  New sessions: type a prompt\n\n"
+        "  ● fix the tests\n\n"
+        "  ctrl+x to delete · ? for shortcuts\n"
+    )
+
+    def test_detected_with_hint_and_without_logo_or_blanks(self) -> None:
+        result = extract_interactive_content(self.PANE)
+        assert result is not None
+        assert result.name == "AgentView"
+        lines = result.content.split("\n")
+        assert lines[0].startswith("⚠️")
+        assert "" not in lines
+        assert "▐" not in result.content
+
+    def test_long_list_fits_a_telegram_message(self) -> None:
+        rows = "".join(f"  ● session number {i}\n" for i in range(600))
+        pane = f"  New sessions:\n{rows}  ctrl+x to delete\n"
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert len(result.content) < 4096
+        assert result.content.endswith("ctrl+x to delete")
