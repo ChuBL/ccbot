@@ -80,6 +80,8 @@ from .handlers.callback_data import (
     CB_SESSION_SELECT,
     CB_KEYS_PREFIX,
     CB_SCREENSHOT_REFRESH,
+    CB_TRUST_NO,
+    CB_TRUST_YES,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
@@ -105,11 +107,15 @@ from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
+    TRUST_DIALOG,
+    answer_trust_dialog,
     clear_interactive_mode,
     clear_interactive_msg,
+    expect_ready,
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
+    hold_text,
     set_interactive_mode,
 )
 from .handlers.message_queue import (
@@ -132,7 +138,11 @@ from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
-from .terminal_parser import extract_bash_output, is_interactive_ui
+from .terminal_parser import (
+    extract_bash_output,
+    extract_interactive_content,
+    is_interactive_ui,
+)
 from .tmux_manager import tmux_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
@@ -989,6 +999,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 thread_id,
             )
             await handle_interactive_ui(context.bot, user.id, wid, thread_id)
+            # Enter on the trust dialog would pick its default, "No, exit"
+            content = extract_interactive_content(pane_text)
+            if content and content.name == TRUST_DIALOG:
+                await safe_reply(
+                    update.message,
+                    "Not sent: answer the trust prompt first, with the buttons above.",
+                )
+                return
             # Small delay to let UI render in Telegram before text arrives
             await asyncio.sleep(0.3)
     except Exception as e:
@@ -1015,6 +1033,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # --- Window creation helper ---
+
+
+async def _startup_prompt_showing(window_id: str, timeout: float = 8.0) -> bool:
+    """Wait briefly for a prompt that holds up Claude Code's start."""
+    for _ in range(int(timeout / 0.5)):
+        pane_text = await tmux_manager.capture_pane(window_id)
+        if pane_text and is_interactive_ui(pane_text):
+            return True
+        await asyncio.sleep(0.5)
+    return False
 
 
 async def _create_and_bind_window(
@@ -1119,10 +1147,16 @@ async def _create_and_bind_window(
                 if context.user_data is not None:
                     context.user_data.pop("_pending_thread_text", None)
                     context.user_data.pop("_pending_thread_id", None)
-                send_ok, send_msg = await session_manager.send_to_window(
-                    created_wid,
-                    pending_text,
-                )
+                # With no SessionStart yet, something is on screen ahead of Claude
+                # Code, and the text would answer it
+                if not hook_ok and await _startup_prompt_showing(created_wid):
+                    hold_text(created_wid, user.id, pending_thread_id, pending_text)
+                    send_ok, send_msg = True, ""
+                else:
+                    send_ok, send_msg = await session_manager.send_to_window(
+                        created_wid,
+                        pending_text,
+                    )
                 if not send_ok:
                     logger.warning("Failed to forward pending text: %s", send_msg)
                     resolved_chat = session_manager.resolve_chat_id(
@@ -1169,6 +1203,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, cb_thread_id, chat.id)
+
+    # Workspace trust dialog
+    if data.startswith((CB_TRUST_YES, CB_TRUST_NO)):
+        trust = data.startswith(CB_TRUST_YES)
+        wanted = data[len(CB_TRUST_YES if trust else CB_TRUST_NO) :]
+        wid = (
+            session_manager.get_window_for_thread(user.id, cb_thread_id)
+            if cb_thread_id is not None
+            else None
+        )
+        if wid is None or cb_thread_id is None or wid != wanted:
+            await query.answer("This prompt has expired.", show_alert=True)
+            return
+        await query.answer()
+        ok, text = await answer_trust_dialog(wid, trust)
+        if ok:
+            await clear_interactive_msg(user.id, context.bot, cb_thread_id)
+            if trust:
+                expect_ready(wid, user.id, cb_thread_id)
+        await context.bot.send_message(
+            chat_id=session_manager.resolve_chat_id(user.id, cb_thread_id),
+            message_thread_id=cb_thread_id,
+            text=text if ok else f"❌ {text}",
+        )
+        return
 
     # History: older/newer pagination
     # Format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>

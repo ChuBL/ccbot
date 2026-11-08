@@ -27,9 +27,11 @@ from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
 from ..tmux_manager import tmux_manager
 from .interactive_ui import (
+    announce_ready,
     clear_interactive_msg,
     get_interactive_window,
     handle_interactive_ui,
+    release_held_text,
 )
 from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_message_queue
@@ -72,6 +74,9 @@ async def update_status_message(
     if not pane_text:
         # Transient capture failure - keep existing status message
         return
+
+    await announce_ready(bot, window_id, w.pane_current_command, pane_text)
+    await release_held_text(bot, window_id, w.pane_current_command, pane_text)
 
     interactive_window = get_interactive_window(user_id, thread_id)
     should_check_new_ui = True

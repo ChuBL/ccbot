@@ -42,11 +42,26 @@ class UIPattern:
     top: tuple[re.Pattern[str], ...]
     bottom: tuple[re.Pattern[str], ...]
     min_gap: int = 2  # minimum lines between top and bottom (inclusive)
+    compact: bool = False  # drop blank lines and indentation (full-screen views)
+    hint: str = ""  # line saying what to do, shown above a compacted region
+    # The region must end the screen: a dialog's last frame stays visible after
+    # Claude Code quits, with the shell prompt below it
+    at_end: bool = False
 
 
 # ── UI pattern definitions (order matters — first match wins) ────────────
 
 UI_PATTERNS: list[UIPattern] = [
+    UIPattern(
+        # First start in a new folder. Comes before the menu patterns below; the
+        # default choice is "No, exit", so a forwarded message would close Claude Code
+        name="TrustDialog",
+        top=(re.compile(r"^\s*Accessing workspace:\s*$"),),
+        bottom=(re.compile(r"^\s*Enter to confirm"),),
+        compact=True,
+        hint="🔐 Claude Code needs your OK before it can work in this folder.",
+        at_end=True,
+    ),
     UIPattern(
         name="ExitPlanMode",
         top=(
@@ -130,6 +145,12 @@ def _shorten_separators(text: str) -> str:
     )
 
 
+def _compact(text: str, hint: str) -> str:
+    """Drop blank lines and indentation, and put the hint first."""
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    return "\n".join(([hint] if hint else []) + lines)
+
+
 # ── Core extraction ──────────────────────────────────────────────────────
 
 
@@ -143,7 +164,17 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
     top_idx: int | None = None
     bottom_idx: int | None = None
 
-    for i, line in enumerate(lines):
+    # Frames left by earlier runs can sit above the live one: only the last counts
+    first = 0
+    if pattern.at_end:
+        matches = [
+            i
+            for i, line in enumerate(lines)
+            if any(p.search(line) for p in pattern.top)
+        ]
+        first = matches[-1] if matches else 0
+
+    for i, line in enumerate(lines[first:], first):
         if top_idx is None:
             if any(p.search(line) for p in pattern.top):
                 top_idx = i
@@ -163,8 +194,12 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
 
     if bottom_idx is None or bottom_idx - top_idx < pattern.min_gap:
         return None
+    if pattern.at_end and any(line.strip() for line in lines[bottom_idx + 1 :]):
+        return None
 
     content = "\n".join(lines[top_idx : bottom_idx + 1]).rstrip()
+    if pattern.compact:
+        content = _compact(content, pattern.hint)
     return InteractiveUIContent(content=_shorten_separators(content), name=pattern.name)
 
 

@@ -47,5 +47,9 @@ CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>
 CB_SESSION_NEW = "rs:new"  # start a new session
 CB_SESSION_CANCEL = "rs:cancel"  # cancel
 
+# Workspace trust dialog
+CB_TRUST_YES = "tr:yes:"  # tr:yes:<window>
+CB_TRUST_NO = "tr:no:"  # tr:no:<window>
+
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
