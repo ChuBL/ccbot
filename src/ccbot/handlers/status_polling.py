@@ -29,6 +29,7 @@ from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
 from ..tmux_manager import tmux_manager
 from .interactive_ui import (
+    SHELLS,
     clear_interactive_msg,
     get_interactive_window,
     handle_interactive_ui,
@@ -52,7 +53,6 @@ _RE_RESUME_LINE = re.compile(
     r"(claude\b[^\n]*--resume\s+[0-9a-fA-F-]{36}[^\n]*?)[ \t]*$",
     re.MULTILINE,
 )
-_SHELLS = frozenset({"zsh", "bash", "sh", "dash", "fish"})
 # window_id -> resume command already handled ("" while something other than a shell runs)
 _resume_seen: dict[str, str] = {}
 
@@ -66,7 +66,7 @@ async def _forward_resume_line(
     pane_text: str,
 ) -> None:
     """Send the resume command to the topic once per exit."""
-    if pane_command not in _SHELLS:
+    if pane_command not in SHELLS:
         _resume_seen[window_id] = ""
         return
     found = _RE_RESUME_LINE.findall(pane_text)
