@@ -740,7 +740,14 @@ class SessionManager:
                         # Track last user message as fallback
                         elif TranscriptParser.is_user_message(data):
                             parsed = TranscriptParser.parse_message(data)
-                            if parsed and parsed.text.strip():
+                            # Only what the user typed: a session ended with /exit would
+                            # otherwise be labelled by that command's "(no content)" output
+                            if (
+                                parsed
+                                and parsed.message_type == "user"
+                                and not data.get("isMeta")
+                                and parsed.text.strip()
+                            ):
                                 last_user_msg = parsed.text.strip()
                     except json.JSONDecodeError:
                         continue
@@ -789,7 +796,8 @@ class SessionManager:
                 break
             session_id = f.stem
             session = await self._get_session_direct(session_id, cwd)
-            if session and session.message_count > 0:
+            # "Untitled" means nothing was ever typed in it (opened, then /exit)
+            if session and session.message_count > 0 and session.summary != "Untitled":
                 sessions.append(session)
         return sessions
 

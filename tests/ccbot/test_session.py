@@ -342,3 +342,51 @@ class TestLoadSessionMapMigration:
 
         await mgr.load_session_map()
         assert mgr.get_window_state("@4").session_id == "sid-1"
+
+
+_EXIT_ENTRIES = [
+    {
+        "type": "user",
+        "isMeta": True,
+        "message": {"content": "<local-command-caveat>x</local-command-caveat>"},
+    },
+    {
+        "type": "user",
+        "message": {"content": "<command-name>/exit</command-name>"},
+    },
+    {
+        "type": "user",
+        "message": {
+            "content": "<local-command-stdout>(no content)</local-command-stdout>"
+        },
+    },
+]
+
+
+class TestResumeList:
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def _write(self, tmp_path, monkeypatch, entries: list[dict]) -> None:
+        project = tmp_path / "-work-app"
+        project.mkdir()
+        (project / f"{self.SID}.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in entries) + "\n"
+        )
+        monkeypatch.setattr(session_mod.config, "claude_projects_path", tmp_path)
+
+    @staticmethod
+    def _user(content: str, **extra) -> dict:
+        return {"type": "user", "message": {"content": content}, **extra}
+
+    async def test_opened_and_exited_session_is_hidden(
+        self, mgr, tmp_path, monkeypatch
+    ) -> None:
+        self._write(tmp_path, monkeypatch, _EXIT_ENTRIES)
+        assert await mgr.list_sessions_for_directory("/work/app") == []
+
+    async def test_label_skips_local_command_output(
+        self, mgr, tmp_path, monkeypatch
+    ) -> None:
+        self._write(tmp_path, monkeypatch, [self._user("real prompt"), *_EXIT_ENTRIES])
+        sessions = await mgr.list_sessions_for_directory("/work/app")
+        assert [s.summary for s in sessions] == ["real prompt"]
