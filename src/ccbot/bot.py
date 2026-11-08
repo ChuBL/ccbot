@@ -105,11 +105,13 @@ from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
+    SHELLS,
     clear_interactive_mode,
     clear_interactive_msg,
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
+    send_window_snapshot,
     set_interactive_mode,
 )
 from .handlers.message_queue import (
@@ -892,7 +894,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         all_windows = await tmux_manager.list_windows()
         bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
         unbound = [
-            (w.window_id, w.window_name, w.cwd)
+            (w.window_id, w.window_name, w.cwd, w.pane_current_command)
             for w in all_windows
             if w.window_id not in bound_ids
         ]
@@ -900,7 +902,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Window picker check: all=%s, bound=%s, unbound=%s",
             [w.window_name for w in all_windows],
             bound_ids,
-            [name for _, name, _ in unbound],
+            [name for _, name, _, _ in unbound],
         )
 
         if unbound:
@@ -1493,6 +1495,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"✅ Bound to window `{display}`",
         )
 
+        # Show what this window is running and has on screen
+        await send_window_snapshot(context.bot, user.id, selected_wid, thread_id)
+
         # Forward pending text if any
         pending_text = (
             context.user_data.get("_pending_thread_text") if context.user_data else None
@@ -1500,7 +1505,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if context.user_data is not None:
             context.user_data.pop("_pending_thread_text", None)
             context.user_data.pop("_pending_thread_id", None)
-        if pending_text:
+        # The message that opened the picker was meant for Claude Code, not for a
+        # shell or for whatever prompt is on screen
+        pane_text = await tmux_manager.capture_pane(selected_wid) or ""
+        if pending_text and (
+            w.pane_current_command in SHELLS or is_interactive_ui(pane_text)
+        ):
+            await safe_send(
+                context.bot,
+                session_manager.resolve_chat_id(user.id, thread_id),
+                "⚠️ Your first message was not sent to this window. "
+                "Send it again if you want it there.",
+                message_thread_id=thread_id,
+            )
+        elif pending_text:
             send_ok, send_msg = await session_manager.send_to_window(
                 selected_wid, pending_text
             )

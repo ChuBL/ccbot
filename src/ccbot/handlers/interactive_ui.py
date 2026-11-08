@@ -14,13 +14,18 @@ Provides:
 State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
 
+import html
 import logging
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 
 from ..session import session_manager
-from ..terminal_parser import extract_interactive_content, is_interactive_ui
+from ..terminal_parser import (
+    extract_interactive_content,
+    is_interactive_ui,
+    screen_tail,
+)
 from ..tmux_manager import tmux_manager
 from .callback_data import (
     CB_ASK_DOWN,
@@ -76,6 +81,34 @@ def clear_interactive_mode(user_id: int, thread_id: int | None = None) -> None:
 def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | None:
     """Get the interactive message ID for a user."""
     return _interactive_msgs.get((user_id, thread_id or 0))
+
+
+SHELLS = frozenset({"zsh", "bash", "sh", "dash", "fish"})
+
+
+async def send_window_snapshot(
+    bot: Bot, user_id: int, window_id: str, thread_id: int | None
+) -> None:
+    """Tell the topic what the window it was just attached to is showing."""
+    w = await tmux_manager.find_window_by_id(window_id)
+    if not w:
+        return
+    screen = screen_tail(await tmux_manager.capture_pane(w.window_id) or "")
+    text = f"🖥 <b>{html.escape(w.pane_current_command)}</b> in {html.escape(w.cwd)}"
+    if w.pane_current_command in SHELLS:
+        text += "\nThis window is at the shell: messages here run as commands."
+    text += (
+        f"\n<pre>{html.escape(screen)}</pre>" if screen else "\n(The screen is empty.)"
+    )
+    try:
+        await bot.send_message(
+            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
+            message_thread_id=thread_id,
+            text=text,
+            parse_mode="HTML",
+        )
+    except TelegramError as e:
+        logger.warning("Could not send window snapshot: %s", e)
 
 
 def _build_interactive_keyboard(

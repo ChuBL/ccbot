@@ -130,6 +130,12 @@ def _shorten_separators(text: str) -> str:
     )
 
 
+def screen_tail(pane_text: str, max_lines: int = 30, max_chars: int = 3500) -> str:
+    """The last non-blank lines of a pane, short enough for one Telegram message."""
+    lines = [line.rstrip() for line in pane_text.split("\n") if line.strip()]
+    return _shorten_separators("\n".join(lines[-max_lines:]))[-max_chars:].strip("\n")
+
+
 # ── Core extraction ──────────────────────────────────────────────────────
 
 

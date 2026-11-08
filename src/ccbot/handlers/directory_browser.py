@@ -75,25 +75,25 @@ def clear_session_picker_state(user_data: dict | None) -> None:
 
 
 def build_window_picker(
-    windows: list[tuple[str, str, str]],
+    windows: list[tuple[str, str, str, str]],
 ) -> tuple[str, InlineKeyboardMarkup, list[str]]:
     """Build window picker UI for unbound tmux windows.
 
     Args:
-        windows: List of (window_id, window_name, cwd) tuples.
+        windows: List of (window_id, window_name, cwd, pane_command) tuples.
 
     Returns: (text, keyboard, window_ids) where window_ids is the ordered list for caching.
     """
-    window_ids = [wid for wid, _, _ in windows]
+    window_ids = [wid for wid, _, _, _ in windows]
 
     lines = [
         "*Bind to Existing Window*\n",
         "These windows are running but not bound to any topic.",
         "Pick one to attach it here, or start a new session.\n",
     ]
-    for _wid, name, cwd in windows:
+    for _wid, name, cwd, command in windows:
         display_cwd = cwd.replace(str(Path.home()), "~")
-        lines.append(f"• `{name}` — {display_cwd}")
+        lines.append(f"• `{name}` — `{command}` — {display_cwd}")
 
     buttons: list[list[InlineKeyboardButton]] = []
     for i in range(0, len(windows), 2):
