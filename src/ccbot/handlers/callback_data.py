@@ -31,6 +31,10 @@ CB_WIN_CANCEL = "wb:cancel"
 # Screenshot
 CB_SCREENSHOT_REFRESH = "ss:ref:"
 
+# Kill window (/kill asks first)
+CB_KILL_YES = "kw:yes:"  # kw:yes:<window_id>
+CB_KILL_NO = "kw:no"
+
 # Interactive UI (aq: prefix kept for backward compatibility)
 CB_ASK_UP = "aq:up:"  # aq:up:<window>
 CB_ASK_DOWN = "aq:down:"  # aq:down:<window>
