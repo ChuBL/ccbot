@@ -15,15 +15,24 @@ State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
+import shutil
+import time
+from pathlib import Path
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
+from ..config import config
 from ..session import session_manager
-from ..terminal_parser import extract_interactive_content, is_interactive_ui
+from ..terminal_parser import (
+    _shorten_separators,
+    extract_interactive_content,
+    is_interactive_ui,
+)
 from ..tmux_manager import tmux_manager
 from .callback_data import (
     CB_AGENT_OPEN,
@@ -36,6 +45,8 @@ from .callback_data import (
     CB_ASK_SPACE,
     CB_ASK_TAB,
     CB_ASK_UP,
+    CB_TRUST_NO,
+    CB_TRUST_YES,
 )
 from .message_sender import NO_LINK_PREVIEW
 
@@ -86,11 +97,12 @@ def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | 
 SHELLS = frozenset({"zsh", "bash", "sh", "dash", "fish"})
 AGENT_VIEW = "AgentView"
 _MAX_SESSION_BUTTONS = 8
+_TRASH_KEEP_SECONDS = 30 * 86400
 _PANE_WAIT_SECONDS = 15.0
 
 
-async def list_background_sessions() -> list[dict[str, str]]:
-    """Background sessions `claude attach` can open; empty if listing fails."""
+async def _claude_agents() -> list[dict[str, str]] | None:
+    """Every session Claude Code has open; None if listing fails."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "claude",
@@ -103,12 +115,175 @@ async def list_background_sessions() -> list[dict[str, str]]:
         sessions = json.loads(stdout)
     except (OSError, TimeoutError, ValueError) as e:
         logger.warning("Could not list background sessions: %s", e)
-        return []
+        return None
+    return sessions
+
+
+async def list_background_sessions() -> list[dict[str, str]]:
+    """Background sessions `claude attach` can open; empty if listing fails."""
     return [
         s
-        for s in sessions
+        for s in await _claude_agents() or []
         if s.get("kind") == "background" and s.get("id") and s.get("sessionId")
     ]
+
+
+async def trash_session(session_id: str, file_path: str) -> tuple[bool, str]:
+    """Move a finished session's transcript to the trash; refuses one still open."""
+    agents = await _claude_agents()
+    if agents is None:
+        return False, "Could not tell whether it is still open. Nothing was deleted."
+    windows = await tmux_manager.list_windows()
+    in_window = any(
+        (state := session_manager.window_states.get(w.window_id))
+        and state.session_id == session_id
+        for w in windows
+    )
+    if in_window or any(a.get("sessionId") == session_id for a in agents):
+        return False, "It is still open in a window or in the background. Close it first."
+
+    source = Path(file_path)
+    if source.stem != session_id or not source.is_file():
+        return False, "This list has expired. Nothing was deleted."
+    trash = config.config_dir / "trash" / source.parent.name
+
+    def _move() -> None:
+        trash.mkdir(parents=True, exist_ok=True)
+        shutil.move(source, trash / source.name)
+        # The 30 days count from now, not from the session's last activity
+        os.utime(trash / source.name)
+        # Claude Code keeps subagent and tool output in a folder named after the session
+        companion = source.with_suffix("")
+        if companion.is_dir():
+            shutil.move(companion, trash / companion.name)
+            os.utime(trash / companion.name)
+
+    try:
+        await asyncio.to_thread(_move)
+    except OSError as e:
+        logger.error("Could not trash session %s: %s", session_id, e)
+        return False, "Could not delete it."
+    return True, "Deleted"
+
+
+def purge_trash() -> None:
+    """Permanently remove trashed sessions older than the keep period."""
+    cutoff = time.time() - _TRASH_KEEP_SECONDS
+    for entry in (config.config_dir / "trash").glob("*/*"):
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            logger.info("Purged trashed session %s", entry.name)
+        except OSError as e:
+            logger.warning("Could not purge %s: %s", entry, e)
+
+
+# Local patch: the workspace trust dialog gets its own two buttons
+TRUST_DIALOG = "TrustDialog"
+_TRUST_MOVE_TRIES = 15
+_SNAPSHOT_LINES = 30
+_SNAPSHOT_MAX_CHARS = 3500
+# window_id -> (user_id, thread_id, text): first message waiting for the dialog to be answered
+_held_text: dict[str, tuple[int, int | None, str]] = {}
+
+
+def hold_text(window_id: str, user_id: int, thread_id: int | None, text: str) -> None:
+    """Keep a message back until the prompt on screen has been answered."""
+    _held_text[window_id] = (user_id, thread_id, text)
+
+
+async def release_held_text(
+    bot: Bot, window_id: str, pane_command: str, pane_text: str
+) -> None:
+    """Send a held message once Claude Code is up, or say it was dropped."""
+    held = _held_text.get(window_id)
+    if not held or is_interactive_ui(pane_text):
+        return
+    user_id, thread_id, text = held
+    if pane_command in SHELLS:
+        del _held_text[window_id]
+        await bot.send_message(
+            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
+            message_thread_id=thread_id,
+            text="⚠️ Claude Code is not running, so your first message was not sent.",
+        )
+    elif session_manager.get_window_state(window_id).session_id:
+        del _held_text[window_id]
+        await session_manager.send_to_window(window_id, text)
+
+
+async def answer_trust_dialog(window_id: str, trust: bool) -> tuple[bool, str]:
+    """Answer the trust dialog, checking first that it is still on screen."""
+
+    async def on_screen() -> list[str] | None:
+        pane_text = await tmux_manager.capture_pane(window_id)
+        content = extract_interactive_content(pane_text) if pane_text else None
+        if content and content.name == TRUST_DIALOG:
+            return content.content.split("\n")
+        return None
+
+    lines = await on_screen()
+    if lines is None:
+        return False, "This prompt has expired. Nothing was changed."
+    if trust:
+        # Keys sent right after the dialog draws can be lost, and Enter on the
+        # default would quit: press it only with the cursor seen on the Yes line
+        for _ in range(_TRUST_MOVE_TRIES):
+            lines = await on_screen() or []
+            cursor = next((i for i, l in enumerate(lines) if l.startswith("❯")), None)
+            target = next((i for i, l in enumerate(lines) if "Yes, I trust" in l), None)
+            if cursor is None or target is None:
+                return False, "Could not read the prompt. Nothing was changed."
+            if cursor == target:
+                break
+            key = "Down" if target > cursor else "Up"
+            await tmux_manager.send_keys(window_id, key, enter=False, literal=False)
+            await asyncio.sleep(0.3)
+        else:
+            return False, "Could not move to Yes. Nothing was changed."
+        await tmux_manager.send_keys(window_id, "Enter", enter=False, literal=False)
+    else:
+        await tmux_manager.send_keys(window_id, "Escape", enter=False, literal=False)
+    for _ in range(20):
+        await asyncio.sleep(0.25)
+        if await on_screen() is None:
+            if trust:
+                return True, "✅ Folder trusted. Claude Code is starting."
+            return True, (
+                "❌ Claude Code closed. This window is at the shell: "
+                "send claude to start it again, or /kill to close the window."
+            )
+    return False, "Claude Code did not respond to that."
+
+
+async def send_window_snapshot(
+    bot: Bot, user_id: int, window_id: str, thread_id: int | None
+) -> None:
+    """Tell the topic what the window it was just attached to is showing."""
+    w = await tmux_manager.find_window_by_id(window_id)
+    if not w:
+        return
+    pane_text = await tmux_manager.capture_pane(w.window_id) or ""
+    lines = [line.rstrip() for line in pane_text.split("\n") if line.strip()]
+    screen = _shorten_separators("\n".join(lines[-_SNAPSHOT_LINES:]))
+    screen = screen[-_SNAPSHOT_MAX_CHARS:].strip("\n")
+    text = f"🖥 <b>{html.escape(w.pane_current_command)}</b> in {html.escape(w.cwd)}"
+    if w.pane_current_command in SHELLS:
+        text += "\nThis window is at the shell: messages here run as commands."
+    text += f"\n<pre>{html.escape(screen)}</pre>" if screen else "\n(The screen is empty.)"
+    try:
+        await bot.send_message(
+            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
+            message_thread_id=thread_id,
+            text=text,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning("Could not send window snapshot: %s", e)
 
 
 async def _wait_for_pane(window_id: str, at_shell: bool) -> bool:
@@ -202,6 +377,20 @@ def _build_interactive_keyboard(
     since only vertical selection is needed.  ``sessions`` adds one button
     per background session above the keys.
     """
+    if ui_name == TRUST_DIALOG:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Yes, trust", callback_data=f"{CB_TRUST_YES}{window_id}"[:64]
+                    ),
+                    InlineKeyboardButton(
+                        "❌ No, exit", callback_data=f"{CB_TRUST_NO}{window_id}"[:64]
+                    ),
+                ]
+            ]
+        )
+
     vertical_only = ui_name == "RestoreCheckpoint"
 
     rows: list[list[InlineKeyboardButton]] = []

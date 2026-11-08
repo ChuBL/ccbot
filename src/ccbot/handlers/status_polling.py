@@ -33,6 +33,8 @@ from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
     handle_interactive_ui,
+    purge_trash,
+    release_held_text,
 )
 from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_message_queue
@@ -44,6 +46,9 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+
+# Local patch: how often to look for trashed sessions past their 30 days
+TRASH_PURGE_INTERVAL = 3600.0  # seconds
 
 # Local patch: pass on the "claude --resume" line Claude Code prints when it quits.
 # Anchored to the start of a line because the same words can be quoted inside a conversation.
@@ -120,6 +125,7 @@ async def update_status_message(
     await _forward_resume_line(
         bot, user_id, window_id, thread_id, w.pane_current_command, pane_text
     )
+    await release_held_text(bot, window_id, w.pane_current_command, pane_text)
 
     interactive_window = get_interactive_window(user_id, thread_id)
     should_check_new_ui = True
@@ -171,10 +177,14 @@ async def status_poll_loop(bot: Bot) -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
     last_topic_check = 0.0
+    last_trash_purge = 0.0
     while True:
         try:
             # Periodic topic existence probe
             now = time.monotonic()
+            if now - last_trash_purge >= TRASH_PURGE_INTERVAL:
+                last_trash_purge = now
+                await asyncio.to_thread(purge_trash)
             if now - last_topic_check >= TOPIC_CHECK_INTERVAL:
                 last_topic_check = now
                 for user_id, thread_id, wid in list(

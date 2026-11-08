@@ -76,13 +76,19 @@ from .handlers.callback_data import (
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
     CB_AGENT_OPEN,
+    CB_SESSION_BACK,
     CB_SESSION_CANCEL,
+    CB_SESSION_DEL,
+    CB_SESSION_DEL_MODE,
+    CB_SESSION_DEL_OK,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
     CB_KEYS_PREFIX,
     CB_KILL_NO,
     CB_KILL_YES,
     CB_SCREENSHOT_REFRESH,
+    CB_TRUST_NO,
+    CB_TRUST_YES,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
@@ -98,6 +104,7 @@ from .handlers.directory_browser import (
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
     build_directory_browser,
+    build_session_delete_confirm,
     build_session_picker,
     build_window_picker,
     clear_browse_state,
@@ -108,13 +115,19 @@ from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
+    SHELLS,
+    TRUST_DIALOG,
+    answer_trust_dialog,
     clear_interactive_mode,
     clear_interactive_msg,
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
+    hold_text,
     open_background_session,
+    send_window_snapshot,
     set_interactive_mode,
+    trash_session,
 )
 from .handlers.message_queue import (
     clear_status_msg_info,
@@ -136,7 +149,11 @@ from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
-from .terminal_parser import extract_bash_output, is_interactive_ui
+from .terminal_parser import (
+    extract_bash_output,
+    extract_interactive_content,
+    is_interactive_ui,
+)
 from .tmux_manager import tmux_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
@@ -200,7 +217,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         all_windows = await tmux_manager.list_windows()
         bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
         unbound = [
-            (w.window_id, w.window_name, w.cwd)
+            (w.window_id, w.window_name, w.cwd, w.pane_current_command)
             for w in all_windows
             if w.window_id not in bound_ids
         ]
@@ -966,7 +983,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         all_windows = await tmux_manager.list_windows()
         bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
         unbound = [
-            (w.window_id, w.window_name, w.cwd)
+            (w.window_id, w.window_name, w.cwd, w.pane_current_command)
             for w in all_windows
             if w.window_id not in bound_ids
         ]
@@ -974,7 +991,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Window picker check: all=%s, bound=%s, unbound=%s",
             [w.window_name for w in all_windows],
             bound_ids,
-            [name for _, name, _ in unbound],
+            [name for _, name, _, _ in unbound],
         )
 
         if unbound:
@@ -1063,6 +1080,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 thread_id,
             )
             await handle_interactive_ui(context.bot, user.id, wid, thread_id)
+            # Local patch: Enter on the trust dialog would pick its default, "No, exit"
+            content = extract_interactive_content(pane_text)
+            if content and content.name == TRUST_DIALOG:
+                await safe_reply(
+                    update.message,
+                    "Not sent: answer the trust prompt first, with the buttons above.",
+                )
+                return
             # Small delay to let UI render in Telegram before text arrives
             await asyncio.sleep(0.3)
     except Exception as e:
@@ -1089,6 +1114,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # --- Window creation helper ---
+
+
+async def _startup_prompt_showing(window_id: str, timeout: float = 8.0) -> bool:
+    """Wait briefly for a prompt that holds up Claude Code's start."""
+    for _ in range(int(timeout / 0.5)):
+        pane_text = await tmux_manager.capture_pane(window_id)
+        if pane_text and is_interactive_ui(pane_text):
+            return True
+        await asyncio.sleep(0.5)
+    return False
 
 
 async def _create_and_bind_window(
@@ -1193,10 +1228,16 @@ async def _create_and_bind_window(
                 if context.user_data is not None:
                     context.user_data.pop("_pending_thread_text", None)
                     context.user_data.pop("_pending_thread_id", None)
-                send_ok, send_msg = await session_manager.send_to_window(
-                    created_wid,
-                    pending_text,
-                )
+                # Local patch: with no SessionStart yet, something is on screen ahead of
+                # Claude Code, and the text would answer it
+                if not hook_ok and await _startup_prompt_showing(created_wid):
+                    hold_text(created_wid, user.id, pending_thread_id, pending_text)
+                    send_ok, send_msg = True, ""
+                else:
+                    send_ok, send_msg = await session_manager.send_to_window(
+                        created_wid,
+                        pending_text,
+                    )
                 if not send_ok:
                     logger.warning("Failed to forward pending text: %s", send_msg)
                     resolved_chat = session_manager.resolve_chat_id(
@@ -1245,6 +1286,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         session_manager.set_group_chat_id(user.id, cb_thread_id, chat.id)
 
     # Agent view: open a background session in this window (local patch)
+    if data.startswith((CB_TRUST_YES, CB_TRUST_NO)):
+        trust = data.startswith(CB_TRUST_YES)
+        wanted = data[len(CB_TRUST_YES if trust else CB_TRUST_NO) :]
+        wid = (
+            session_manager.get_window_for_thread(user.id, cb_thread_id)
+            if cb_thread_id is not None
+            else None
+        )
+        if wid != wanted:
+            await query.answer("This prompt has expired.", show_alert=True)
+            return
+        await query.answer()
+        ok, text = await answer_trust_dialog(wid, trust)
+        if ok:
+            await clear_interactive_msg(user.id, context.bot, cb_thread_id)
+        await context.bot.send_message(
+            chat_id=session_manager.resolve_chat_id(user.id, cb_thread_id),
+            message_thread_id=cb_thread_id,
+            text=text if ok else f"❌ {text}",
+        )
+        return
+
     if data.startswith(CB_AGENT_OPEN):
         short_id, _, wanted = data[len(CB_AGENT_OPEN) :].partition(":")
         wid = (
@@ -1551,6 +1614,50 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             resume_session_id=session.session_id,
         )
 
+    # Session picker: delete (local patch)
+    elif data in (CB_SESSION_DEL_MODE, CB_SESSION_BACK) or data.startswith(
+        (CB_SESSION_DEL, CB_SESSION_DEL_OK)
+    ):
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        cached = context.user_data.get(SESSIONS_KEY) if context.user_data else None
+        if cached is None:
+            await query.answer("This list has expired.", show_alert=True)
+            return
+        if data in (CB_SESSION_DEL_MODE, CB_SESSION_BACK):
+            text, keyboard = build_session_picker(
+                cached, delete_mode=data == CB_SESSION_DEL_MODE
+            )
+            await safe_edit(query, text, reply_markup=keyboard)
+            await query.answer()
+            return
+        confirmed = data.startswith(CB_SESSION_DEL_OK)
+        wanted_id = data[len(CB_SESSION_DEL_OK if confirmed else CB_SESSION_DEL) :]
+        session = next((s for s in cached if s.session_id == wanted_id), None)
+        if session is None:
+            await query.answer("This list has expired.", show_alert=True)
+            return
+        if not confirmed:
+            text, keyboard = build_session_delete_confirm(session)
+            await safe_edit(query, text, reply_markup=keyboard)
+            await query.answer()
+            return
+        ok, result = await trash_session(session.session_id, session.file_path)
+        if not ok:
+            await query.answer(result, show_alert=True)
+            return
+        remaining = await session_manager.list_sessions_for_directory(
+            context.user_data.get("_selected_path", str(Path.cwd()))
+        )
+        context.user_data[SESSIONS_KEY] = remaining
+        text, keyboard = build_session_picker(remaining, delete_mode=bool(remaining))
+        await safe_edit(query, text, reply_markup=keyboard)
+        await query.answer(result)
+
     elif data == CB_SESSION_NEW:
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
@@ -1631,6 +1738,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"✅ Bound to window `{display}`",
         )
 
+        # Local patch: show what this window is running and has on screen
+        await send_window_snapshot(context.bot, user.id, selected_wid, thread_id)
+
         # Forward pending text if any
         pending_text = (
             context.user_data.get("_pending_thread_text") if context.user_data else None
@@ -1638,7 +1748,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if context.user_data is not None:
             context.user_data.pop("_pending_thread_text", None)
             context.user_data.pop("_pending_thread_id", None)
-        if pending_text:
+        # Local patch: the message that opened the picker was meant for Claude Code,
+        # not for a shell or for whatever prompt is on screen
+        pane_text = await tmux_manager.capture_pane(selected_wid) or ""
+        if pending_text and (
+            w.pane_current_command in SHELLS or is_interactive_ui(pane_text)
+        ):
+            await safe_send(
+                context.bot,
+                session_manager.resolve_chat_id(user.id, thread_id),
+                "⚠️ Your first message was not sent to this window. Send it again if you want it there.",
+                message_thread_id=thread_id,
+            )
+        elif pending_text:
             send_ok, send_msg = await session_manager.send_to_window(
                 selected_wid, pending_text
             )

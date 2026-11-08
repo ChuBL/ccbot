@@ -45,11 +45,24 @@ class UIPattern:
     # Local patch: full-screen views need blanks and the logo dropped, and a line saying what to do
     compact: bool = False
     hint: str = ""
+    # Local patch: the region must end the screen (a dialog's last frame stays visible
+    # after Claude Code quits, with the shell prompt below it)
+    at_end: bool = False
 
 
 # ── UI pattern definitions (order matters — first match wins) ────────────
 
 UI_PATTERNS: list[UIPattern] = [
+    UIPattern(
+        # Local patch: first start in a new folder. Comes before the menu patterns below;
+        # the default choice is "No, exit", so a forwarded message would close Claude Code
+        name="TrustDialog",
+        top=(re.compile(r"^\s*Accessing workspace:\s*$"),),
+        bottom=(re.compile(r"^\s*Enter to confirm"),),
+        compact=True,
+        hint="🔐 Claude Code needs your OK before it can work in this folder.",
+        at_end=True,
+    ),
     UIPattern(
         name="ExitPlanMode",
         top=(
@@ -204,6 +217,8 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
                 break
 
     if bottom_idx is None or bottom_idx - top_idx < pattern.min_gap:
+        return None
+    if pattern.at_end and any(line.strip() for line in lines[bottom_idx + 1 :]):
         return None
 
     content = "\n".join(lines[top_idx : bottom_idx + 1]).rstrip()

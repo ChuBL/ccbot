@@ -29,6 +29,10 @@ from .callback_data import (
     CB_DIR_SELECT,
     CB_DIR_UP,
     CB_SESSION_CANCEL,
+    CB_SESSION_BACK,
+    CB_SESSION_DEL,
+    CB_SESSION_DEL_MODE,
+    CB_SESSION_DEL_OK,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
     CB_WIN_BIND,
@@ -75,25 +79,25 @@ def clear_session_picker_state(user_data: dict | None) -> None:
 
 
 def build_window_picker(
-    windows: list[tuple[str, str, str]],
+    windows: list[tuple[str, str, str, str]],
 ) -> tuple[str, InlineKeyboardMarkup, list[str]]:
     """Build window picker UI for unbound tmux windows.
 
     Args:
-        windows: List of (window_id, window_name, cwd) tuples.
+        windows: List of (window_id, window_name, cwd, pane_command) tuples.
 
     Returns: (text, keyboard, window_ids) where window_ids is the ordered list for caching.
     """
-    window_ids = [wid for wid, _, _ in windows]
+    window_ids = [wid for wid, _, _, _ in windows]
 
     lines = [
         "*Bind to Existing Window*\n",
         "These windows are running but not bound to any topic.",
         "Pick one to attach it here, or start a new session.\n",
     ]
-    for _wid, name, cwd in windows:
+    for _wid, name, cwd, command in windows:
         display_cwd = cwd.replace(str(Path.home()), "~")
-        lines.append(f"• `{name}` — {display_cwd}")
+        lines.append(f"• `{name}` — `{command}` — {display_cwd}")
 
     buttons: list[list[InlineKeyboardButton]] = []
     for i in range(0, len(windows), 2):
@@ -212,20 +216,48 @@ def _relative_time(file_path: str) -> str:
     return f"{d}d ago"
 
 
+def build_session_delete_confirm(
+    session: ClaudeSession,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Ask before deleting one session (local patch)."""
+    text = (
+        "*Delete this session?*\n\n"
+        f"{session.summary[:80]} — {session.message_count} msgs\n\n"
+        "It moves to `~/.ccbot/trash` and is removed for good after 30 days."
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🗑 Delete",
+                    callback_data=f"{CB_SESSION_DEL_OK}{session.session_id}",
+                ),
+                InlineKeyboardButton("◀ Back", callback_data=CB_SESSION_DEL_MODE),
+            ]
+        ]
+    )
+    return text, keyboard
+
+
 def build_session_picker(
     sessions: list[ClaudeSession],
+    delete_mode: bool = False,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build session picker UI for resuming an existing Claude session.
 
     Args:
         sessions: List of ClaudeSession objects (sorted by recency).
+        delete_mode: Buttons delete sessions instead of resuming them.
 
     Returns: (text, keyboard).
     """
-    lines = [
-        "*Resume Session?*\n",
-        "Existing sessions found in this directory.\n",
-    ]
+    if delete_mode:
+        heading = ["*Delete a Session*\n", "Tap the one to delete.\n"]
+    elif sessions:
+        heading = ["*Resume Session?*\n", "Existing sessions found in this directory.\n"]
+    else:
+        heading = ["*Resume Session?*\n", "No sessions left in this directory."]
+    lines = heading
     for i, s in enumerate(sessions):
         summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
         rel = _relative_time(s.file_path)
@@ -238,19 +270,29 @@ def build_session_picker(
         for j in range(min(2, len(sessions) - i)):
             s = sessions[i + j]
             label = s.summary[:14] + "…" if len(s.summary) > 14 else s.summary
-            row.append(
-                InlineKeyboardButton(
+            if delete_mode:
+                button = InlineKeyboardButton(
+                    f"🗑 {label}", callback_data=f"{CB_SESSION_DEL}{s.session_id}"
+                )
+            else:
+                button = InlineKeyboardButton(
                     f"▶ {label}", callback_data=f"{CB_SESSION_SELECT}{i + j}"
                 )
-            )
+            row.append(button)
         buttons.append(row)
 
-    buttons.append(
-        [
+    if delete_mode:
+        buttons.append([InlineKeyboardButton("◀ Back", callback_data=CB_SESSION_BACK)])
+    else:
+        actions = [
             InlineKeyboardButton("➕ New Session", callback_data=CB_SESSION_NEW),
             InlineKeyboardButton("Cancel", callback_data=CB_SESSION_CANCEL),
         ]
-    )
+        if sessions:
+            actions.insert(
+                1, InlineKeyboardButton("🗑 Delete…", callback_data=CB_SESSION_DEL_MODE)
+            )
+        buttons.append(actions)
 
     text = "\n".join(lines)
     return text, InlineKeyboardMarkup(buttons)

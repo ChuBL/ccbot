@@ -50,6 +50,15 @@ CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
 CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>
 CB_SESSION_NEW = "rs:new"  # start a new session
 CB_SESSION_CANCEL = "rs:cancel"  # cancel
+# Session picker: delete (local patch)
+CB_SESSION_DEL_MODE = "rs:dm"  # list sessions to delete
+CB_SESSION_BACK = "rs:back"  # back to the resume list
+CB_SESSION_DEL = "rs:del:"  # rs:del:<session id>, asks first
+CB_SESSION_DEL_OK = "rs:delok:"  # rs:delok:<session id>
+
+# Workspace trust dialog (local patch)
+CB_TRUST_YES = "tr:yes:"  # tr:yes:<window>
+CB_TRUST_NO = "tr:no:"  # tr:no:<window>
 
 # Agent view: open a background session (local patch)
 CB_AGENT_OPEN = "ag:open:"  # ag:open:<short session id>:<window>
