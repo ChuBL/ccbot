@@ -29,6 +29,7 @@ from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
 from ..tmux_manager import tmux_manager
 from .interactive_ui import (
+    announce_ready,
     SHELLS,
     clear_interactive_msg,
     get_interactive_window,
@@ -125,6 +126,7 @@ async def update_status_message(
     await _forward_resume_line(
         bot, user_id, window_id, thread_id, w.pane_current_command, pane_text
     )
+    await announce_ready(bot, window_id, w.pane_current_command, pane_text)
     await release_held_text(bot, window_id, w.pane_current_command, pane_text)
 
     interactive_window = get_interactive_window(user_id, thread_id)

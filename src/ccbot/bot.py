@@ -127,6 +127,7 @@ from .handlers.interactive_ui import (
     answer_trust_dialog,
     clear_interactive_mode,
     clear_interactive_msg,
+    expect_ready,
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
@@ -1330,6 +1331,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ok, text = await answer_trust_dialog(wid, trust)
         if ok:
             await clear_interactive_msg(user.id, context.bot, cb_thread_id)
+            if trust:
+                expect_ready(wid, user.id, cb_thread_id)
         await context.bot.send_message(
             chat_id=session_manager.resolve_chat_id(user.id, cb_thread_id),
             message_thread_id=cb_thread_id,

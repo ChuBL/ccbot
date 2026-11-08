@@ -19,6 +19,7 @@ import html
 import json
 import logging
 import os
+import time
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -113,6 +114,7 @@ _SNAPSHOT_LINES = 30
 _SNAPSHOT_MAX_CHARS = 3500
 # window_id -> (user_id, thread_id, text): first message waiting for the dialog to be answered
 _held_text: dict[str, tuple[int, int | None, str]] = {}
+_READY_TIMEOUT_SECONDS = 15.0
 
 
 def hold_text(window_id: str, user_id: int, thread_id: int | None, text: str) -> None:
@@ -138,6 +140,41 @@ async def release_held_text(
     elif session_manager.get_window_state(window_id).session_id:
         del _held_text[window_id]
         await session_manager.send_to_window(window_id, text)
+
+
+# window_id -> (user_id, thread_id, session id before the trust answer, give-up time)
+_awaiting_ready: dict[str, tuple[int, int | None, str, float]] = {}
+
+
+def expect_ready(window_id: str, user_id: int, thread_id: int | None) -> None:
+    """Announce this window once Claude Code has finished starting."""
+    _awaiting_ready[window_id] = (
+        user_id,
+        thread_id,
+        session_manager.get_window_state(window_id).session_id,
+        time.monotonic() + _READY_TIMEOUT_SECONDS,
+    )
+
+
+async def announce_ready(
+    bot: Bot, window_id: str, pane_command: str, pane_text: str
+) -> None:
+    """Tell the topic Claude Code is up, as its start screen is not forwarded."""
+    waiting = _awaiting_ready.get(window_id)
+    if not waiting or is_interactive_ui(pane_text):
+        return
+    user_id, thread_id, earlier, give_up_at = waiting
+    if pane_command in SHELLS:
+        del _awaiting_ready[window_id]
+        return
+    # Compared with the earlier id because window ids get reused, and a resumed
+    # session already has its id: those start without a new id ever appearing
+    current = session_manager.get_window_state(window_id).session_id
+    if (current and current != earlier) or time.monotonic() >= give_up_at:
+        del _awaiting_ready[window_id]
+        await send_window_snapshot(
+            bot, user_id, window_id, thread_id, title="✅ Claude Code is ready"
+        )
 
 
 async def answer_trust_dialog(window_id: str, trust: bool) -> tuple[bool, str]:
@@ -185,9 +222,13 @@ async def answer_trust_dialog(window_id: str, trust: bool) -> tuple[bool, str]:
 
 
 async def send_window_snapshot(
-    bot: Bot, user_id: int, window_id: str, thread_id: int | None
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    thread_id: int | None,
+    title: str = "",
 ) -> None:
-    """Tell the topic what the window it was just attached to is showing."""
+    """Tell the topic what the window is running and showing."""
     w = await tmux_manager.find_window_by_id(window_id)
     if not w:
         return
@@ -196,6 +237,8 @@ async def send_window_snapshot(
     screen = _shorten_separators("\n".join(lines[-_SNAPSHOT_LINES:]))
     screen = screen[-_SNAPSHOT_MAX_CHARS:].strip("\n")
     text = f"🖥 <b>{html.escape(w.pane_current_command)}</b> in {html.escape(w.cwd)}"
+    if title:
+        text = f"{html.escape(title)}\n{text}"
     if w.pane_current_command in SHELLS:
         text += "\nThis window is at the shell: messages here run as commands."
     text += (

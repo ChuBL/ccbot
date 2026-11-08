@@ -7,6 +7,9 @@ import pytest
 from ccbot.handlers.interactive_ui import (
     _build_interactive_keyboard,
     _held_text,
+    _awaiting_ready,
+    announce_ready,
+    expect_ready,
     answer_trust_dialog,
     handle_interactive_ui,
     hold_text,
@@ -190,3 +193,62 @@ class TestHeldText:
             await release_held_text(mock_bot, "@1", "claude", "❯ ")
         sm.send_to_window.assert_awaited_once_with("@1", "hello")
         assert "@1" not in _held_text
+
+
+class TestAnnounceReady:
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        _awaiting_ready.clear()
+        yield
+        _awaiting_ready.clear()
+
+    @staticmethod
+    def _state(sm: MagicMock, session_id: str) -> None:
+        sm.get_window_state.return_value.session_id = session_id
+        sm.resolve_chat_id.return_value = 1
+
+    async def test_waits_for_a_new_session_id(self, mock_bot) -> None:
+        with (
+            patch("ccbot.handlers.interactive_ui.session_manager") as sm,
+            patch(
+                "ccbot.handlers.interactive_ui.send_window_snapshot", AsyncMock()
+            ) as snapshot,
+        ):
+            self._state(sm, "old-id")
+            expect_ready("@1", 1, 7)
+            await announce_ready(mock_bot, "@1", "claude", "❯ ")
+            snapshot.assert_not_awaited()
+            assert "@1" in _awaiting_ready
+
+            self._state(sm, "new-id")
+            await announce_ready(mock_bot, "@1", "claude", "❯ ")
+        snapshot.assert_awaited_once()
+        assert snapshot.await_args.kwargs["title"] == "✅ Claude Code is ready"
+        assert "@1" not in _awaiting_ready
+
+    async def test_gives_up_waiting_for_an_id(self, mock_bot) -> None:
+        with (
+            patch("ccbot.handlers.interactive_ui.session_manager") as sm,
+            patch("ccbot.handlers.interactive_ui._READY_TIMEOUT_SECONDS", 0.0),
+            patch(
+                "ccbot.handlers.interactive_ui.send_window_snapshot", AsyncMock()
+            ) as snapshot,
+        ):
+            self._state(sm, "resumed-id")
+            expect_ready("@1", 1, 7)
+            await announce_ready(mock_bot, "@1", "claude", "❯ ")
+        snapshot.assert_awaited_once()
+        assert snapshot.await_args.kwargs["title"] == "✅ Claude Code is ready"
+
+    async def test_silent_if_claude_code_exited(self, mock_bot) -> None:
+        with (
+            patch("ccbot.handlers.interactive_ui.session_manager") as sm,
+            patch(
+                "ccbot.handlers.interactive_ui.send_window_snapshot", AsyncMock()
+            ) as snapshot,
+        ):
+            self._state(sm, "")
+            expect_ready("@1", 1, 7)
+            await announce_ready(mock_bot, "@1", "zsh", "user@host ➜")
+        snapshot.assert_not_awaited()
+        assert "@1" not in _awaiting_ready
