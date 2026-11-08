@@ -1,11 +1,13 @@
 """Unit tests for SessionMonitor JSONL reading and offset handling."""
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
+from ccbot.config import config
 from ccbot.monitor_state import TrackedSession
-from ccbot.session_monitor import SessionMonitor
+from ccbot.session_monitor import SessionInfo, SessionMonitor
 
 
 class TestReadNewLinesOffsetRecovery:
@@ -146,3 +148,108 @@ class TestReadNewLinesOffsetRecovery:
         # Should reset offset to 0 and read the line
         assert session.last_byte_offset == jsonl_file.stat().st_size
         assert len(result) == 1
+
+
+class TestSessionStarts:
+    """A session started while the bot watches: first prompt kept, topic told."""
+
+    WINDOW = "@1"
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    @pytest.fixture
+    def monitor(self, tmp_path, monkeypatch):
+        map_file = tmp_path / "session_map.json"
+        monkeypatch.setattr(config, "session_map_file", map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "T")
+        mon = SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+        mon.started = []
+
+        async def on_start(window_id, session_id, source):
+            mon.started.append((window_id, session_id, source))
+
+        mon.set_session_start_callback(on_start)
+        return mon
+
+    def _write_map(self, source, started_at, sid=None):
+        config.session_map_file.write_text(
+            json.dumps(
+                {
+                    f"T:{self.WINDOW}": {
+                        "session_id": sid or self.SID,
+                        "cwd": "/tmp",
+                        "window_name": "w",
+                        "source": source,
+                        "started_at": started_at,
+                    }
+                }
+            )
+        )
+
+    async def _tick(self, mon):
+        current = await mon._detect_and_cleanup_changes()
+        await mon._handle_session_starts()
+        return await mon.check_for_updates(set(current.values()))
+
+    async def _first_sight(self, mon, tmp_path, make_jsonl_entry, source):
+        """Run the poll that announces a start, then the one that finds its file."""
+        self._write_map(source, 100.0)
+        await self._tick(mon)
+        jsonl = tmp_path / f"{self.SID}.jsonl"
+        jsonl.write_text(
+            json.dumps(make_jsonl_entry(msg_type="user", content="first prompt")) + "\n"
+        )
+        mon.scan_projects = AsyncMock(
+            return_value=[SessionInfo(session_id=self.SID, file_path=jsonl)]
+        )
+        await self._tick(mon)
+        return await self._tick(mon), jsonl
+
+    @pytest.mark.asyncio
+    async def test_new_session_keeps_first_prompt(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        monitor.scan_projects = AsyncMock(return_value=[])
+        msgs, _ = await self._first_sight(
+            monitor, tmp_path, make_jsonl_entry, "startup"
+        )
+        assert [m.text for m in msgs] == ["first prompt"]
+        assert monitor.started == [(self.WINDOW, self.SID, "startup")]
+
+    @pytest.mark.asyncio
+    async def test_resumed_session_skips_history(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        monitor.scan_projects = AsyncMock(return_value=[])
+        msgs, _ = await self._first_sight(monitor, tmp_path, make_jsonl_entry, "resume")
+        assert msgs == []
+        assert monitor.started == [(self.WINDOW, self.SID, "resume")]
+
+    @pytest.mark.asyncio
+    async def test_same_id_restart_announced_once_each(self, monitor):
+        monitor.scan_projects = AsyncMock(return_value=[])
+        self._write_map("resume", 100.0)
+        await self._tick(monitor)
+        await self._tick(monitor)
+        self._write_map("resume", 200.0)
+        await self._tick(monitor)
+        assert len(monitor.started) == 2
+
+    @pytest.mark.asyncio
+    async def test_clear_is_fresh_but_silent(self, monitor):
+        monitor.scan_projects = AsyncMock(return_value=[])
+        self._write_map("clear", 100.0)
+        await self._tick(monitor)
+        assert monitor.started == []
+        assert self.SID in monitor._fresh_sessions
+
+    @pytest.mark.asyncio
+    async def test_map_without_source_is_silent(self, monitor):
+        """The agent picker's manual `ccbot hook` carries no source."""
+        monitor.scan_projects = AsyncMock(return_value=[])
+        self._write_map("", 100.0)
+        await self._tick(monitor)
+        assert monitor.started == []
+        assert monitor._fresh_sessions == set()

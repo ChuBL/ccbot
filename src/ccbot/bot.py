@@ -2121,6 +2121,24 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 # --- App lifecycle ---
 
 
+async def handle_session_started(
+    window_id: str, session_id: str, source: str, bot: Bot
+) -> None:
+    """Tell a window's topic that Claude Code started there, wherever it was launched."""
+    what = "resumed" if source == "resume" else "new"
+    text = (
+        f"▶️ Claude Code is running in this window ({what} session `{session_id[:8]}`)"
+    )
+    for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
+        if wid == window_id:
+            await safe_send(
+                bot,
+                session_manager.resolve_chat_id(user_id, thread_id),
+                text,
+                message_thread_id=thread_id,
+            )
+
+
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task
 
@@ -2160,7 +2178,13 @@ async def post_init(application: Application) -> None:
     async def message_callback(msg: NewMessage) -> None:
         await handle_new_message(msg, application.bot)
 
+    async def session_start_callback(
+        window_id: str, session_id: str, source: str
+    ) -> None:
+        await handle_session_started(window_id, session_id, source, application.bot)
+
     monitor.set_message_callback(message_callback)
+    monitor.set_session_start_callback(session_start_callback)
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")

@@ -28,6 +28,11 @@ from .utils import read_cwd_from_jsonl
 
 logger = logging.getLogger(__name__)
 
+# SessionStart sources that create a session id nobody has seen before
+_NEW_SESSION_SOURCES = {"startup", "clear"}
+# SessionStart sources worth telling the topic about (not /clear or compaction)
+_ANNOUNCED_SOURCES = {"startup", "resume"}
+
 
 @dataclass
 class SessionInfo:
@@ -84,11 +89,25 @@ class SessionMonitor:
         self._last_session_map: dict[str, str] = {}  # window_key -> session_id
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
+        # window_key -> (started_at, source, session_id) from the latest session_map read
+        self._latest_starts: dict[str, tuple[float, str, str]] = {}
+        self._seen_starts: dict[str, float] = {}  # window_key -> started_at handled
+        # Sessions born while we watch: everything in their file is new, read it from 0
+        self._fresh_sessions: set[str] = set()
+        self._session_start_callback: (
+            Callable[[str, str, str], Awaitable[None]] | None
+        ) = None
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
         self._message_callback = callback
+
+    def set_session_start_callback(
+        self, callback: Callable[[str, str, str], Awaitable[None]]
+    ) -> None:
+        """Set the callback for (window_id, session_id, source) on a Claude Code start."""
+        self._session_start_callback = callback
 
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
@@ -308,10 +327,14 @@ class SessionMonitor:
                     except OSError:
                         file_size = 0
                         current_mtime = 0.0
+                    # Claude Code creates the file with the first prompt, so
+                    # skipping to the end would lose that prompt
+                    fresh = session_info.session_id in self._fresh_sessions
+                    self._fresh_sessions.discard(session_info.session_id)
                     tracked = TrackedSession(
                         session_id=session_info.session_id,
                         file_path=str(session_info.file_path),
-                        last_byte_offset=file_size,
+                        last_byte_offset=0 if fresh else file_size,
                     )
                     self.state.update_session(tracked)
                     self._file_mtimes[session_info.session_id] = current_mtime
@@ -394,6 +417,7 @@ class SessionMonitor:
         Only entries matching our tmux_session_name are processed.
         """
         window_to_session: dict[str, str] = {}
+        starts: dict[str, tuple[float, str, str]] = {}
         if config.session_map_file.exists():
             try:
                 async with aiofiles.open(config.session_map_file, "r") as f:
@@ -408,8 +432,16 @@ class SessionMonitor:
                     session_id = info.get("session_id", "")
                     if session_id:
                         window_to_session[window_key] = session_id
+                        started_at = info.get("started_at")
+                        if isinstance(started_at, (int, float)):
+                            starts[window_key] = (
+                                float(started_at),
+                                str(info.get("source", "")),
+                                session_id,
+                            )
             except (json.JSONDecodeError, OSError):
                 pass
+        self._latest_starts = starts
         return window_to_session
 
     async def _cleanup_all_stale_sessions(self) -> None:
@@ -471,12 +503,27 @@ class SessionMonitor:
             for session_id in sessions_to_remove:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
+                self._fresh_sessions.discard(session_id)
             self.state.save_if_dirty()
 
         # Update last known map
         self._last_session_map = current_map
 
         return current_map
+
+    async def _handle_session_starts(self) -> None:
+        """Mark brand-new sessions and report starts seen in the session_map."""
+        for window_id, (started_at, source, session_id) in self._latest_starts.items():
+            if self._seen_starts.get(window_id) == started_at:
+                continue
+            self._seen_starts[window_id] = started_at
+            if source in _NEW_SESSION_SOURCES:
+                self._fresh_sessions.add(session_id)
+            if source in _ANNOUNCED_SOURCES and self._session_start_callback:
+                try:
+                    await self._session_start_callback(window_id, session_id, source)
+                except Exception as e:
+                    logger.error(f"Session start callback error: {e}")
 
     async def _monitor_loop(self) -> None:
         """Background loop for checking session updates.
@@ -492,6 +539,8 @@ class SessionMonitor:
         await self._cleanup_all_stale_sessions()
         # Initialize last known session_map
         self._last_session_map = await self._load_current_session_map()
+        # Starts from before this run are history, not news
+        self._seen_starts = {k: v[0] for k, v in self._latest_starts.items()}
 
         while self._running:
             try:
@@ -501,6 +550,8 @@ class SessionMonitor:
                 # Detect session_map changes and cleanup replaced/removed sessions
                 current_map = await self._detect_and_cleanup_changes()
                 active_session_ids = set(current_map.values())
+
+                await self._handle_session_starts()
 
                 # Check for new messages (all I/O is async)
                 new_messages = await self.check_for_updates(active_session_ids)

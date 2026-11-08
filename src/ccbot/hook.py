@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -252,6 +253,9 @@ def hook_main() -> None:
                     "session_id": session_id,
                     "cwd": cwd,
                     "window_name": window_name,
+                    # Lets the monitor notice a restart even when the id is unchanged
+                    "source": payload.get("source", ""),
+                    "started_at": time.time(),
                 }
 
                 # Clean up old-format key ("session:window_name") if it exists.
