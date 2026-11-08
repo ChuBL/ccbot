@@ -47,5 +47,8 @@ CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>
 CB_SESSION_NEW = "rs:new"  # start a new session
 CB_SESSION_CANCEL = "rs:cancel"  # cancel
 
+# Agent view: open a background session
+CB_AGENT_OPEN = "ag:open:"  # ag:open:<short session id>:<window>
+
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>

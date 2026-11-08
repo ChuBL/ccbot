@@ -75,6 +75,7 @@ from .handlers.callback_data import (
     CB_DIR_UP,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
+    CB_AGENT_OPEN,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
@@ -110,6 +111,7 @@ from .handlers.interactive_ui import (
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
+    open_background_session,
     set_interactive_mode,
 )
 from .handlers.message_queue import (
@@ -1169,6 +1171,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, cb_thread_id, chat.id)
+
+    # Agent view: open a background session in this window
+    if data.startswith(CB_AGENT_OPEN):
+        short_id, _, wanted = data[len(CB_AGENT_OPEN) :].partition(":")
+        wid = (
+            session_manager.get_window_for_thread(user.id, cb_thread_id)
+            if cb_thread_id is not None
+            else None
+        )
+        if wid is None or cb_thread_id is None or wid != wanted:
+            await query.answer("This list has expired.", show_alert=True)
+            return
+        await query.answer("Opening…")
+        ok, text = await open_background_session(wid, short_id)
+        if ok:
+            await clear_interactive_msg(user.id, context.bot, cb_thread_id)
+        await context.bot.send_message(
+            chat_id=session_manager.resolve_chat_id(user.id, cb_thread_id),
+            message_thread_id=cb_thread_id,
+            text=text if ok else f"❌ {text}",
+        )
+        return
 
     # History: older/newer pagination
     # Format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>

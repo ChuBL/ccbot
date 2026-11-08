@@ -133,7 +133,7 @@ UI_PATTERNS: list[UIPattern] = [
         compact=True,
         hint=(
             "⚠️ Claude Code has not quit: this is its session list. "
-            "Send /exit again to get to the shell. "
+            "Tap ▶ to open a session, or send /exit again to get to the shell. "
             "Plain text here starts a new session."
         ),
     ),

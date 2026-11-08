@@ -1,5 +1,6 @@
 """Tests for interactive_ui — handle_interactive_ui and keyboard layout."""
 
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,8 +8,11 @@ import pytest
 from ccbot.handlers.interactive_ui import (
     _build_interactive_keyboard,
     handle_interactive_ui,
+    list_background_sessions,
+    open_background_session,
 )
 from ccbot.handlers.callback_data import (
+    CB_AGENT_OPEN,
     CB_ASK_DOWN,
     CB_ASK_ENTER,
     CB_ASK_ESC,
@@ -109,3 +113,70 @@ class TestKeyboardLayoutForSettings:
         assert any(CB_ASK_RIGHT in d for d in all_cb_data if d)
         assert any(CB_ASK_ESC in d for d in all_cb_data if d)
         assert any(CB_ASK_ENTER in d for d in all_cb_data if d)
+
+
+class TestAgentViewButtons:
+    SESSIONS: ClassVar[list[dict[str, str]]] = [
+        {"id": "abc12345", "sessionId": "sid", "name": "fix tests", "cwd": "/work"}
+    ]
+    AGENT_VIEW_PANE = "  New sessions: x\n  ● a\n  ctrl+x to delete\n"
+
+    def test_one_button_per_session_above_the_keys(self) -> None:
+        keyboard = _build_interactive_keyboard("@5", "AgentView", self.SESSIONS)
+        button = keyboard.inline_keyboard[0][0]
+        assert button.text == "▶ fix tests"
+        assert button.callback_data == f"{CB_AGENT_OPEN}abc12345:@5"
+        assert len(keyboard.inline_keyboard) == 4  # one session + three rows of keys
+
+    async def test_lists_only_background_sessions(self) -> None:
+        agents = b'[{"kind": "background", "id": "a", "sessionId": "s"},'
+        agents += b' {"kind": "interactive", "id": null, "sessionId": "t"}]'
+        proc = MagicMock(communicate=AsyncMock(return_value=(agents, b"")))
+        with patch(
+            "ccbot.handlers.interactive_ui.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ):
+            sessions = await list_background_sessions()
+        assert [s["id"] for s in sessions] == ["a"]
+
+    async def test_old_button_does_not_exit_a_conversation_in_use(self) -> None:
+        tmux = MagicMock()
+        tmux.find_window_by_id = AsyncMock(return_value=MagicMock(window_id="@5"))
+        tmux.capture_pane = AsyncMock(return_value="❯ an ordinary conversation")
+        tmux.send_keys = AsyncMock()
+        with (
+            patch("ccbot.handlers.interactive_ui.tmux_manager", tmux),
+            patch(
+                "ccbot.handlers.interactive_ui.list_background_sessions",
+                AsyncMock(return_value=self.SESSIONS),
+            ),
+        ):
+            ok, _ = await open_background_session("@5", "abc12345")
+        assert not ok
+        tmux.send_keys.assert_not_awaited()
+
+    async def test_exits_then_attaches_then_points_the_window(self) -> None:
+        tmux = MagicMock()
+        tmux.find_window_by_id = AsyncMock(return_value=MagicMock(window_id="@5"))
+        tmux.capture_pane = AsyncMock(return_value=self.AGENT_VIEW_PANE)
+        tmux.send_keys = AsyncMock(return_value=True)
+        point = AsyncMock(return_value=True)
+        with (
+            patch("ccbot.handlers.interactive_ui.tmux_manager", tmux),
+            patch(
+                "ccbot.handlers.interactive_ui.list_background_sessions",
+                AsyncMock(return_value=self.SESSIONS),
+            ),
+            patch(
+                "ccbot.handlers.interactive_ui._wait_for_pane",
+                AsyncMock(return_value=True),
+            ),
+            patch("ccbot.handlers.interactive_ui._point_window_at_session", point),
+        ):
+            ok, _ = await open_background_session("@5", "abc12345")
+        assert ok
+        assert [c.args[1] for c in tmux.send_keys.call_args_list] == [
+            "/exit",
+            "claude attach abc12345",
+        ]
+        point.assert_awaited_once_with("@5", "sid", "/work")

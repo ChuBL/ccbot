@@ -14,7 +14,10 @@ Provides:
 State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
 
+import asyncio
+import json
 import logging
+import os
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -23,6 +26,7 @@ from ..session import session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
 from ..tmux_manager import tmux_manager
 from .callback_data import (
+    CB_AGENT_OPEN,
     CB_ASK_DOWN,
     CB_ASK_ENTER,
     CB_ASK_ESC,
@@ -78,18 +82,137 @@ def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | 
     return _interactive_msgs.get((user_id, thread_id or 0))
 
 
+# Buttons in the agent view that open a background session
+SHELLS = frozenset({"zsh", "bash", "sh", "dash", "fish"})
+AGENT_VIEW = "AgentView"
+_MAX_SESSION_BUTTONS = 8
+_PANE_WAIT_SECONDS = 15.0
+
+
+async def list_background_sessions() -> list[dict[str, str]]:
+    """Background sessions `claude attach` can open; empty if listing fails."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude",
+            "agents",
+            "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        sessions = json.loads(stdout)
+    except (OSError, TimeoutError, ValueError) as e:
+        logger.warning("Could not list background sessions: %s", e)
+        return []
+    return [
+        s
+        for s in sessions
+        if s.get("kind") == "background" and s.get("id") and s.get("sessionId")
+    ]
+
+
+async def _wait_for_pane(window_id: str, at_shell: bool) -> bool:
+    """Wait until the pane is at a shell (or has left it)."""
+    for _ in range(int(_PANE_WAIT_SECONDS / 0.25)):
+        await asyncio.sleep(0.25)
+        w = await tmux_manager.find_window_by_id(window_id)
+        if not w:
+            return False
+        if (w.pane_current_command in SHELLS) == at_shell:
+            return True
+    return False
+
+
+async def _point_window_at_session(window_id: str, session_id: str, cwd: str) -> bool:
+    """Record what this window now shows, through the SessionStart hook's own path.
+
+    Attaching to a background session does not fire that hook, and without
+    this the session's replies never reach the topic.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "tmux",
+        "display-message",
+        "-t",
+        window_id,
+        "-p",
+        "#{pane_id}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    pane_id = stdout.decode().strip()
+    if proc.returncode != 0 or not pane_id:
+        return False
+    proc = await asyncio.create_subprocess_exec(
+        "ccbot",
+        "hook",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        env={**os.environ, "TMUX_PANE": pane_id},
+    )
+    payload = {
+        "session_id": session_id,
+        "cwd": cwd,
+        "hook_event_name": "SessionStart",
+    }
+    await proc.communicate(json.dumps(payload).encode())
+    return proc.returncode == 0
+
+
+async def open_background_session(window_id: str, short_id: str) -> tuple[bool, str]:
+    """Leave the agent view for the shell, then attach this window to a session."""
+    target = next(
+        (s for s in await list_background_sessions() if s["id"] == short_id), None
+    )
+    if not target:
+        return False, "That session is no longer running."
+
+    # An old button must not send /exit to a conversation in use
+    w = await tmux_manager.find_window_by_id(window_id)
+    pane_text = await tmux_manager.capture_pane(w.window_id) if w else None
+    content = extract_interactive_content(pane_text) if pane_text else None
+    if not w or not content or content.name != AGENT_VIEW:
+        return False, "This list has expired. Nothing was changed."
+
+    name = target.get("name") or target["id"]
+    await tmux_manager.send_keys(w.window_id, "/exit")
+    if not await _wait_for_pane(window_id, at_shell=True):
+        return False, "Claude Code did not quit, so the session was not opened."
+    await tmux_manager.send_keys(w.window_id, f"claude attach {target['id']}")
+    if not await _wait_for_pane(window_id, at_shell=False):
+        return False, f"Could not open '{name}'. The window is at the shell."
+    if not await _point_window_at_session(
+        window_id, target["sessionId"], target.get("cwd", "")
+    ):
+        return False, f"Opened '{name}', but its replies may not reach this topic."
+    return True, f"▶ Opened '{name}'. Replies here now come from it."
+
+
 def _build_interactive_keyboard(
     window_id: str,
     ui_name: str = "",
+    sessions: list[dict[str, str]] | None = None,
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
     ``ui_name`` controls the layout: ``RestoreCheckpoint`` omits ←/→ keys
-    since only vertical selection is needed.
+    since only vertical selection is needed.  ``sessions`` adds one button
+    per background session above the keys.
     """
     vertical_only = ui_name == "RestoreCheckpoint"
 
     rows: list[list[InlineKeyboardButton]] = []
+    for s in (sessions or [])[:_MAX_SESSION_BUTTONS]:
+        name = (s.get("name") or s["id"])[:32]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"▶ {name}",
+                    callback_data=f"{CB_AGENT_OPEN}{s['id']}:{window_id}"[:64],
+                )
+            ]
+        )
     # Row 1: directional keys
     rows.append(
         [
@@ -180,7 +303,16 @@ async def handle_interactive_ui(
         return False
 
     # Build message with navigation keyboard
-    keyboard = _build_interactive_keyboard(window_id, ui_name=content.name)
+    sessions: list[dict[str, str]] = []
+    if content.name == AGENT_VIEW:
+        # The window's own session is the one Esc returns to
+        own = session_manager.get_window_state(window_id).session_id
+        sessions = [
+            s for s in await list_background_sessions() if s["sessionId"] != own
+        ]
+    keyboard = _build_interactive_keyboard(
+        window_id, ui_name=content.name, sessions=sessions
+    )
 
     # Send as plain text (no markdown conversion)
     text = content.content
