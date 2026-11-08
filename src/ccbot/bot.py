@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 
 from telegram import (
+    CallbackQuery,
     Bot,
     BotCommand,
     InlineKeyboardButton,
@@ -82,11 +83,13 @@ from .handlers.callback_data import (
     CB_SESSION_DEL_MODE,
     CB_SESSION_DEL_OK,
     CB_SESSION_NEW,
+    CB_SESSION_RESTORE,
     CB_SESSION_SELECT,
     CB_KEYS_PREFIX,
     CB_KILL_NO,
     CB_KILL_YES,
     CB_SCREENSHOT_REFRESH,
+    CB_SESSION_TRASH,
     CB_TRUST_NO,
     CB_TRUST_YES,
     CB_WIN_BIND,
@@ -97,6 +100,9 @@ from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
+    PICKER_DELETE,
+    PICKER_RESUME,
+    PICKER_TRASH,
     SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
@@ -112,6 +118,7 @@ from .handlers.directory_browser import (
     clear_window_picker_state,
 )
 from .handlers.cleanup import clear_topic_state
+from .handlers.session_trash import restore_session, trash_session
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
@@ -127,7 +134,6 @@ from .handlers.interactive_ui import (
     open_background_session,
     send_window_snapshot,
     set_interactive_mode,
-    trash_session,
 )
 from .handlers.message_queue import (
     clear_status_msg_info,
@@ -1116,6 +1122,28 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- Window creation helper ---
 
 
+async def _show_session_picker(
+    query: CallbackQuery,
+    user_data: dict,
+    cwd: str,
+    mode: str = PICKER_RESUME,
+) -> None:
+    """Redraw the session picker from what is on disk now."""
+    sessions = await session_manager.list_sessions_for_directory(cwd)
+    trashed = await session_manager.list_trashed_sessions(cwd)
+    user_data[SESSIONS_KEY] = sessions
+    if (mode == PICKER_TRASH and not trashed) or (
+        mode == PICKER_DELETE and not sessions
+    ):
+        mode = PICKER_RESUME
+    text, keyboard = build_session_picker(
+        trashed if mode == PICKER_TRASH else sessions,
+        mode=mode,
+        has_trash=bool(trashed),
+    )
+    await safe_edit(query, text, reply_markup=keyboard)
+
+
 async def _startup_prompt_showing(window_id: str, timeout: float = 8.0) -> bool:
     """Wait briefly for a prompt that holds up Claude Code's start."""
     for _ in range(int(timeout / 0.5)):
@@ -1298,6 +1326,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("This prompt has expired.", show_alert=True)
             return
         await query.answer()
+        assert wid is not None and cb_thread_id is not None  # wanted is a window id
         ok, text = await answer_trust_dialog(wid, trust)
         if ok:
             await clear_interactive_msg(user.id, context.bot, cb_thread_id)
@@ -1319,6 +1348,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("This list has expired.", show_alert=True)
             return
         await query.answer("Opening…")
+        assert wid is not None and cb_thread_id is not None  # wanted is a window id
         ok, text = await open_background_session(wid, short_id)
         if ok:
             await clear_interactive_msg(user.id, context.bot, cb_thread_id)
@@ -1346,6 +1376,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await safe_edit(query, "This confirmation has expired. Nothing was killed.")
             await query.answer()
             return
+        assert wid is not None and cb_thread_id is not None  # wanted is a window id
         display = session_manager.get_display_name(wid)
         w = await tmux_manager.find_window_by_id(wid)
         killed = bool(w) and await tmux_manager.kill_window(w.window_id)
@@ -1540,14 +1571,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Check for existing sessions in this directory
         sessions = await session_manager.list_sessions_for_directory(selected_path)
-        if sessions:
+        trashed = await session_manager.list_trashed_sessions(selected_path)
+        if (sessions or trashed) and context.user_data is not None:
             # Show session picker — store state for later
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
-                context.user_data[SESSIONS_KEY] = sessions
-                context.user_data["_selected_path"] = selected_path
-            text, keyboard = build_session_picker(sessions)
-            await safe_edit(query, text, reply_markup=keyboard)
+            context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
+            context.user_data["_selected_path"] = selected_path
+            await _show_session_picker(query, context.user_data, selected_path)
             await query.answer()
             return
 
@@ -1614,30 +1643,38 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             resume_session_id=session.session_id,
         )
 
-    # Session picker: delete (local patch)
-    elif data in (CB_SESSION_DEL_MODE, CB_SESSION_BACK) or data.startswith(
-        (CB_SESSION_DEL, CB_SESSION_DEL_OK)
+    # Session picker: delete and restore (local patch)
+    elif data in (CB_SESSION_DEL_MODE, CB_SESSION_BACK, CB_SESSION_TRASH) or (
+        data.startswith((CB_SESSION_DEL, CB_SESSION_DEL_OK, CB_SESSION_RESTORE))
     ):
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
+        user_data = context.user_data
+        if user_data is None or SESSIONS_KEY not in user_data:
+            await query.answer("This list has expired.", show_alert=True)
+            return
+        pending_tid = user_data.get("_pending_thread_id")
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
-        cached = context.user_data.get(SESSIONS_KEY) if context.user_data else None
-        if cached is None:
-            await query.answer("This list has expired.", show_alert=True)
-            return
-        if data in (CB_SESSION_DEL_MODE, CB_SESSION_BACK):
-            text, keyboard = build_session_picker(
-                cached, delete_mode=data == CB_SESSION_DEL_MODE
-            )
-            await safe_edit(query, text, reply_markup=keyboard)
+        cwd = user_data.get("_selected_path", str(Path.cwd()))
+        if data in (CB_SESSION_DEL_MODE, CB_SESSION_BACK, CB_SESSION_TRASH):
+            mode = {
+                CB_SESSION_DEL_MODE: PICKER_DELETE,
+                CB_SESSION_TRASH: PICKER_TRASH,
+            }.get(data, PICKER_RESUME)
+            await _show_session_picker(query, user_data, cwd, mode)
             await query.answer()
+            return
+        if data.startswith(CB_SESSION_RESTORE):
+            ok, result = await restore_session(cwd, data[len(CB_SESSION_RESTORE) :])
+            if ok:
+                await _show_session_picker(query, user_data, cwd, PICKER_TRASH)
+            await query.answer(result, show_alert=not ok)
             return
         confirmed = data.startswith(CB_SESSION_DEL_OK)
         wanted_id = data[len(CB_SESSION_DEL_OK if confirmed else CB_SESSION_DEL) :]
-        session = next((s for s in cached if s.session_id == wanted_id), None)
+        session = next(
+            (s for s in user_data[SESSIONS_KEY] if s.session_id == wanted_id), None
+        )
         if session is None:
             await query.answer("This list has expired.", show_alert=True)
             return
@@ -1647,16 +1684,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer()
             return
         ok, result = await trash_session(session.session_id, session.file_path)
-        if not ok:
-            await query.answer(result, show_alert=True)
-            return
-        remaining = await session_manager.list_sessions_for_directory(
-            context.user_data.get("_selected_path", str(Path.cwd()))
-        )
-        context.user_data[SESSIONS_KEY] = remaining
-        text, keyboard = build_session_picker(remaining, delete_mode=bool(remaining))
-        await safe_edit(query, text, reply_markup=keyboard)
-        await query.answer(result)
+        if ok:
+            await _show_session_picker(query, user_data, cwd, PICKER_DELETE)
+        await query.answer(result, show_alert=not ok)
 
     elif data == CB_SESSION_NEW:
         pending_tid = (

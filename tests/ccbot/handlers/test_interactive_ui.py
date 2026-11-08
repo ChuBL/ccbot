@@ -6,7 +6,11 @@ import pytest
 
 from ccbot.handlers.interactive_ui import (
     _build_interactive_keyboard,
+    _held_text,
+    answer_trust_dialog,
     handle_interactive_ui,
+    hold_text,
+    release_held_text,
 )
 from ccbot.handlers.callback_data import (
     CB_ASK_DOWN,
@@ -109,3 +113,80 @@ class TestKeyboardLayoutForSettings:
         assert any(CB_ASK_RIGHT in d for d in all_cb_data if d)
         assert any(CB_ASK_ESC in d for d in all_cb_data if d)
         assert any(CB_ASK_ENTER in d for d in all_cb_data if d)
+
+
+class TestAnswerTrustDialog:
+    FRAME = (
+        " Accessing workspace:\n /work\n"
+        " {no} No, exit\n {yes} Yes, I trust this folder\n"
+        " Enter to confirm · Esc to cancel\n"
+    )
+
+    def _tmux(self, *frames: str) -> MagicMock:
+        tmux = MagicMock()
+        tmux.capture_pane = AsyncMock(side_effect=list(frames))
+        tmux.send_keys = AsyncMock(return_value=True)
+        return tmux
+
+    def _keys(self, tmux: MagicMock) -> list[str]:
+        return [call.args[1] for call in tmux.send_keys.call_args_list]
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self):
+        with patch("ccbot.handlers.interactive_ui.asyncio.sleep", AsyncMock()):
+            yield
+
+    async def test_enter_only_after_cursor_is_seen_on_yes(self) -> None:
+        on_no = self.FRAME.format(no="❯", yes=" ")
+        on_yes = self.FRAME.format(no=" ", yes="❯")
+        # The first Down is lost: the cursor is still on No when read again
+        tmux = self._tmux(on_no, on_no, on_no, on_yes, "started")
+        with patch("ccbot.handlers.interactive_ui.tmux_manager", tmux):
+            ok, _ = await answer_trust_dialog("@1", True)
+        assert ok
+        assert self._keys(tmux) == ["Down", "Down", "Enter"]
+
+    async def test_no_presses_escape(self) -> None:
+        tmux = self._tmux(self.FRAME.format(no="❯", yes=" "), "user@host ➜")
+        with patch("ccbot.handlers.interactive_ui.tmux_manager", tmux):
+            ok, _ = await answer_trust_dialog("@1", False)
+        assert ok
+        assert self._keys(tmux) == ["Escape"]
+
+    async def test_expired_prompt_sends_nothing(self) -> None:
+        tmux = self._tmux("user@host ➜")
+        with patch("ccbot.handlers.interactive_ui.tmux_manager", tmux):
+            ok, _ = await answer_trust_dialog("@1", True)
+        assert not ok
+        assert self._keys(tmux) == []
+
+
+class TestHeldText:
+    @pytest.fixture(autouse=True)
+    def _held(self):
+        _held_text.clear()
+        hold_text("@1", 1, 7, "hello")
+        yield
+        _held_text.clear()
+
+    async def test_waits_while_a_prompt_is_up(self, mock_bot) -> None:
+        pane = " Accessing workspace:\n x\n y\n Enter to confirm · Esc to cancel\n"
+        await release_held_text(mock_bot, "@1", "claude", pane)
+        assert "@1" in _held_text
+
+    async def test_dropped_with_a_notice_at_the_shell(self, mock_bot) -> None:
+        with patch("ccbot.handlers.interactive_ui.session_manager") as sm:
+            sm.resolve_chat_id.return_value = 1
+            sm.send_to_window = AsyncMock()
+            await release_held_text(mock_bot, "@1", "zsh", "user@host ➜")
+        mock_bot.send_message.assert_awaited_once()
+        sm.send_to_window.assert_not_awaited()
+        assert "@1" not in _held_text
+
+    async def test_sent_once_claude_code_is_up(self, mock_bot) -> None:
+        with patch("ccbot.handlers.interactive_ui.session_manager") as sm:
+            sm.get_window_state.return_value.session_id = "sid"
+            sm.send_to_window = AsyncMock()
+            await release_held_text(mock_bot, "@1", "claude", "❯ ")
+        sm.send_to_window.assert_awaited_once_with("@1", "hello")
+        assert "@1" not in _held_text

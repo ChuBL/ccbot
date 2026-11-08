@@ -19,14 +19,10 @@ import html
 import json
 import logging
 import os
-import shutil
-import time
-from pathlib import Path
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
-from ..config import config
 from ..session import session_manager
 from ..terminal_parser import (
     _shorten_separators,
@@ -49,6 +45,7 @@ from .callback_data import (
     CB_TRUST_YES,
 )
 from .message_sender import NO_LINK_PREVIEW
+from .session_trash import claude_agents
 
 logger = logging.getLogger(__name__)
 
@@ -97,89 +94,16 @@ def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | 
 SHELLS = frozenset({"zsh", "bash", "sh", "dash", "fish"})
 AGENT_VIEW = "AgentView"
 _MAX_SESSION_BUTTONS = 8
-_TRASH_KEEP_SECONDS = 30 * 86400
 _PANE_WAIT_SECONDS = 15.0
-
-
-async def _claude_agents() -> list[dict[str, str]] | None:
-    """Every session Claude Code has open; None if listing fails."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "claude",
-            "agents",
-            "--json",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        sessions = json.loads(stdout)
-    except (OSError, TimeoutError, ValueError) as e:
-        logger.warning("Could not list background sessions: %s", e)
-        return None
-    return sessions
 
 
 async def list_background_sessions() -> list[dict[str, str]]:
     """Background sessions `claude attach` can open; empty if listing fails."""
     return [
         s
-        for s in await _claude_agents() or []
+        for s in await claude_agents() or []
         if s.get("kind") == "background" and s.get("id") and s.get("sessionId")
     ]
-
-
-async def trash_session(session_id: str, file_path: str) -> tuple[bool, str]:
-    """Move a finished session's transcript to the trash; refuses one still open."""
-    agents = await _claude_agents()
-    if agents is None:
-        return False, "Could not tell whether it is still open. Nothing was deleted."
-    windows = await tmux_manager.list_windows()
-    in_window = any(
-        (state := session_manager.window_states.get(w.window_id))
-        and state.session_id == session_id
-        for w in windows
-    )
-    if in_window or any(a.get("sessionId") == session_id for a in agents):
-        return False, "It is still open in a window or in the background. Close it first."
-
-    source = Path(file_path)
-    if source.stem != session_id or not source.is_file():
-        return False, "This list has expired. Nothing was deleted."
-    trash = config.config_dir / "trash" / source.parent.name
-
-    def _move() -> None:
-        trash.mkdir(parents=True, exist_ok=True)
-        shutil.move(source, trash / source.name)
-        # The 30 days count from now, not from the session's last activity
-        os.utime(trash / source.name)
-        # Claude Code keeps subagent and tool output in a folder named after the session
-        companion = source.with_suffix("")
-        if companion.is_dir():
-            shutil.move(companion, trash / companion.name)
-            os.utime(trash / companion.name)
-
-    try:
-        await asyncio.to_thread(_move)
-    except OSError as e:
-        logger.error("Could not trash session %s: %s", session_id, e)
-        return False, "Could not delete it."
-    return True, "Deleted"
-
-
-def purge_trash() -> None:
-    """Permanently remove trashed sessions older than the keep period."""
-    cutoff = time.time() - _TRASH_KEEP_SECONDS
-    for entry in (config.config_dir / "trash").glob("*/*"):
-        try:
-            if entry.stat().st_mtime >= cutoff:
-                continue
-            if entry.is_dir():
-                shutil.rmtree(entry)
-            else:
-                entry.unlink()
-            logger.info("Purged trashed session %s", entry.name)
-        except OSError as e:
-            logger.warning("Could not purge %s: %s", entry, e)
 
 
 # Local patch: the workspace trust dialog gets its own two buttons
@@ -274,7 +198,9 @@ async def send_window_snapshot(
     text = f"🖥 <b>{html.escape(w.pane_current_command)}</b> in {html.escape(w.cwd)}"
     if w.pane_current_command in SHELLS:
         text += "\nThis window is at the shell: messages here run as commands."
-    text += f"\n<pre>{html.escape(screen)}</pre>" if screen else "\n(The screen is empty.)"
+    text += (
+        f"\n<pre>{html.escape(screen)}</pre>" if screen else "\n(The screen is empty.)"
+    )
     try:
         await bot.send_message(
             chat_id=session_manager.resolve_chat_id(user_id, thread_id),
@@ -298,9 +224,7 @@ async def _wait_for_pane(window_id: str, at_shell: bool) -> bool:
     return False
 
 
-async def _point_window_at_session(
-    window_id: str, session_id: str, cwd: str
-) -> bool:
+async def _point_window_at_session(window_id: str, session_id: str, cwd: str) -> bool:
     """Record what this window now shows, through the SessionStart hook's own path.
 
     Attaching to a background session does not fire that hook, and without

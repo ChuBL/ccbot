@@ -719,7 +719,12 @@ class SessionManager:
             else:
                 return None
 
-        # Single pass: read file once, extract summary + count messages
+        return await self._read_session_file(session_id, file_path)
+
+    async def _read_session_file(
+        self, session_id: str, file_path: Path
+    ) -> ClaudeSession | None:
+        """Read one transcript: single pass, extract summary + count messages."""
         summary = ""
         last_user_msg = ""
         message_count = 0
@@ -798,6 +803,24 @@ class SessionManager:
             session = await self._get_session_direct(session_id, cwd)
             # Local patch: "Untitled" means nothing was ever typed in it (opened and /exit)
             if session and session.message_count > 0 and session.summary != "Untitled":
+                sessions.append(session)
+        return sessions
+
+    def trash_dir_for(self, cwd: str) -> Path:
+        """Where deleted sessions of this directory wait to be restored or purged."""
+        return config.config_dir / "trash" / self._encode_cwd(cwd)
+
+    async def list_trashed_sessions(self, cwd: str) -> list[ClaudeSession]:
+        """Deleted sessions of a directory, most recently deleted first, capped at 10."""
+        files = sorted(
+            self.trash_dir_for(cwd).glob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        sessions: list[ClaudeSession] = []
+        for f in files[:10]:
+            session = await self._read_session_file(f.stem, f)
+            if session:
                 sessions.append(session)
         return sessions
 

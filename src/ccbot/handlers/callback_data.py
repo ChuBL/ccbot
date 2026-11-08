@@ -55,6 +55,8 @@ CB_SESSION_DEL_MODE = "rs:dm"  # list sessions to delete
 CB_SESSION_BACK = "rs:back"  # back to the resume list
 CB_SESSION_DEL = "rs:del:"  # rs:del:<session id>, asks first
 CB_SESSION_DEL_OK = "rs:delok:"  # rs:delok:<session id>
+CB_SESSION_TRASH = "rs:trash"  # list the recycle bin
+CB_SESSION_RESTORE = "rs:rst:"  # rs:rst:<session id>
 
 # Workspace trust dialog (local patch)
 CB_TRUST_YES = "tr:yes:"  # tr:yes:<window>

@@ -263,3 +263,19 @@ class TestExtractBashOutput:
         result = extract_bash_output(pane, "echo hi")
         assert result is not None
         assert not result.endswith("\n")
+
+
+class TestTrustDialog:
+    DIALOG = (
+        " Accessing workspace:\n\n /work/app\n\n Quick safety check: Is this a project\n\n"
+        " ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel\n"
+    )
+
+    def test_detected(self) -> None:
+        result = extract_interactive_content(self.DIALOG)
+        assert result is not None
+        assert result.name == "TrustDialog"
+        assert "❯ No, exit" in result.content
+
+    def test_last_frame_above_a_shell_prompt_is_not_a_dialog(self) -> None:
+        assert extract_interactive_content(self.DIALOG + "user@host ➜ app\n") is None

@@ -33,6 +33,8 @@ from .callback_data import (
     CB_SESSION_DEL,
     CB_SESSION_DEL_MODE,
     CB_SESSION_DEL_OK,
+    CB_SESSION_RESTORE,
+    CB_SESSION_TRASH,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
     CB_WIN_BIND,
@@ -53,6 +55,11 @@ BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
 UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
 STATE_SELECTING_SESSION = "selecting_session"
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
+
+# What tapping a session in the session picker does
+PICKER_RESUME = "resume"
+PICKER_DELETE = "delete"
+PICKER_TRASH = "trash"
 
 
 def clear_browse_state(user_data: dict | None) -> None:
@@ -241,23 +248,26 @@ def build_session_delete_confirm(
 
 def build_session_picker(
     sessions: list[ClaudeSession],
-    delete_mode: bool = False,
+    mode: str = PICKER_RESUME,
+    has_trash: bool = False,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Build session picker UI for resuming an existing Claude session.
+    """Build session picker UI for resuming, deleting or restoring a Claude session.
 
     Args:
         sessions: List of ClaudeSession objects (sorted by recency).
-        delete_mode: Buttons delete sessions instead of resuming them.
+        mode: What tapping a session does: PICKER_RESUME, PICKER_DELETE or PICKER_TRASH.
+        has_trash: Offer the recycle bin (resume mode only).
 
     Returns: (text, keyboard).
     """
-    if delete_mode:
-        heading = ["*Delete a Session*\n", "Tap the one to delete.\n"]
+    if mode == PICKER_DELETE:
+        lines = ["*Delete a Session*\n", "Tap the one to delete.\n"]
+    elif mode == PICKER_TRASH:
+        lines = ["*Recycle Bin*\n", "Tap one to restore it. Kept for 30 days.\n"]
     elif sessions:
-        heading = ["*Resume Session?*\n", "Existing sessions found in this directory.\n"]
+        lines = ["*Resume Session?*\n", "Existing sessions found in this directory.\n"]
     else:
-        heading = ["*Resume Session?*\n", "No sessions left in this directory."]
-    lines = heading
+        lines = ["*Resume Session?*\n", "No sessions left in this directory."]
     for i, s in enumerate(sessions):
         summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
         rel = _relative_time(s.file_path)
@@ -270,29 +280,35 @@ def build_session_picker(
         for j in range(min(2, len(sessions) - i)):
             s = sessions[i + j]
             label = s.summary[:14] + "…" if len(s.summary) > 14 else s.summary
-            if delete_mode:
-                button = InlineKeyboardButton(
-                    f"🗑 {label}", callback_data=f"{CB_SESSION_DEL}{s.session_id}"
-                )
+            if mode == PICKER_DELETE:
+                icon, callback = "🗑", f"{CB_SESSION_DEL}{s.session_id}"
+            elif mode == PICKER_TRASH:
+                icon, callback = "♻️", f"{CB_SESSION_RESTORE}{s.session_id}"
             else:
-                button = InlineKeyboardButton(
-                    f"▶ {label}", callback_data=f"{CB_SESSION_SELECT}{i + j}"
-                )
-            row.append(button)
+                icon, callback = "▶", f"{CB_SESSION_SELECT}{i + j}"
+            row.append(InlineKeyboardButton(f"{icon} {label}", callback_data=callback))
         buttons.append(row)
 
-    if delete_mode:
+    if mode != PICKER_RESUME:
         buttons.append([InlineKeyboardButton("◀ Back", callback_data=CB_SESSION_BACK)])
     else:
-        actions = [
-            InlineKeyboardButton("➕ New Session", callback_data=CB_SESSION_NEW),
-            InlineKeyboardButton("Cancel", callback_data=CB_SESSION_CANCEL),
-        ]
+        buttons.append(
+            [
+                InlineKeyboardButton("➕ New Session", callback_data=CB_SESSION_NEW),
+                InlineKeyboardButton("Cancel", callback_data=CB_SESSION_CANCEL),
+            ]
+        )
+        manage = []
         if sessions:
-            actions.insert(
-                1, InlineKeyboardButton("🗑 Delete…", callback_data=CB_SESSION_DEL_MODE)
+            manage.append(
+                InlineKeyboardButton("🗑 Delete…", callback_data=CB_SESSION_DEL_MODE)
             )
-        buttons.append(actions)
+        if has_trash:
+            manage.append(
+                InlineKeyboardButton("♻️ Recycle Bin", callback_data=CB_SESSION_TRASH)
+            )
+        if manage:
+            buttons.append(manage)
 
     text = "\n".join(lines)
     return text, InlineKeyboardMarkup(buttons)
