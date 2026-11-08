@@ -42,6 +42,9 @@ class UIPattern:
     top: tuple[re.Pattern[str], ...]
     bottom: tuple[re.Pattern[str], ...]
     min_gap: int = 2  # minimum lines between top and bottom (inclusive)
+    # Local patch: full-screen views need blanks and the logo dropped, and a line saying what to do
+    compact: bool = False
+    hint: str = ""
 
 
 # ── UI pattern definitions (order matters — first match wins) ────────────
@@ -115,6 +118,25 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*Type to filter"),
         ),
     ),
+    UIPattern(
+        # Local patch: /exit in a session hosted by the background daemon lands here instead of
+        # quitting; plain text sent now would start a new session
+        name="AgentView",
+        top=(
+            re.compile(r"New sessions:"),
+            re.compile(r"\d+ awaiting input\s*·\s*\d+ working"),
+        ),
+        bottom=(
+            re.compile(r"ctrl\+x to delete"),
+            re.compile(r"\? for shortcuts"),
+        ),
+        compact=True,
+        hint=(
+            "⚠️ Claude Code has not quit: this is its session list. "
+            "Tap ▶ to open a session, or send /exit again to get to the shell. "
+            "Plain text here starts a new session."
+        ),
+    ),
 ]
 
 
@@ -128,6 +150,26 @@ def _shorten_separators(text: str) -> str:
     return "\n".join(
         "─────" if _RE_LONG_DASH.match(line) else line for line in text.split("\n")
     )
+
+
+_RE_LOGO_PREFIX = re.compile(r"^[\s▐▛▜▝▘▗▖▌█▀▄]+")
+_COMPACT_MAX_CHARS = 3800  # Telegram rejects messages over 4096
+
+
+def _compact(text: str, hint: str) -> str:
+    """Drop blank lines and the logo, keeping the head and footer when too long."""
+    lines = [_RE_LOGO_PREFIX.sub("", line).rstrip() for line in text.split("\n")]
+    lines = [line for line in lines if line]
+    footer = lines[-3:]
+    room = _COMPACT_MAX_CHARS - len(hint) - sum(len(line) + 1 for line in footer)
+    head: list[str] = []
+    for line in lines[:-3]:
+        room -= len(line) + 1
+        if room < 2:
+            head.append("…")
+            break
+        head.append(line)
+    return "\n".join(([hint] if hint else []) + head + footer)
 
 
 # ── Core extraction ──────────────────────────────────────────────────────
@@ -165,6 +207,8 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
         return None
 
     content = "\n".join(lines[top_idx : bottom_idx + 1]).rstrip()
+    if pattern.compact:
+        content = _compact(content, pattern.hint)
     return InteractiveUIContent(content=_shorten_separators(content), name=pattern.name)
 
 
