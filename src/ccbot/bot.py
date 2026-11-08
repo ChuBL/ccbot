@@ -79,6 +79,8 @@ from .handlers.callback_data import (
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
     CB_KEYS_PREFIX,
+    CB_KILL_NO,
+    CB_KILL_YES,
     CB_SCREENSHOT_REFRESH,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
@@ -274,6 +276,43 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"✅ Topic unbound from window '{display}'.\n"
         "The Claude session is still running in tmux.\n"
         "Send a message to bind to a new session.",
+    )
+
+
+async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask for confirmation, then kill this topic's tmux window."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ This command only works in a topic.")
+        return
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    display = session_manager.get_display_name(wid)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "💥 Kill window", callback_data=f"{CB_KILL_YES}{wid}"[:64]
+                ),
+                InlineKeyboardButton("Cancel", callback_data=CB_KILL_NO),
+            ]
+        ]
+    )
+    await safe_reply(
+        update.message,
+        f"⚠️ Kill tmux window '{display}' ({wid})?\n"
+        "The Claude Code running in it ends. Its transcript stays on disk.",
+        reply_markup=keyboard,
     )
 
 
@@ -1170,6 +1209,48 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, cb_thread_id, chat.id)
 
+    # /kill confirmation
+    if data == CB_KILL_NO:
+        await safe_edit(query, "Cancelled. The window keeps running.")
+        await query.answer()
+        return
+    if data.startswith(CB_KILL_YES):
+        wanted = data[len(CB_KILL_YES) :]
+        # An old button must not kill a window this topic isn't bound to any more
+        wid = (
+            session_manager.get_window_for_thread(user.id, cb_thread_id)
+            if cb_thread_id is not None
+            else None
+        )
+        if wid is None or cb_thread_id is None or wid != wanted:
+            await safe_edit(query, "This confirmation has expired. Nothing was killed.")
+            await query.answer()
+            return
+        display = session_manager.get_display_name(wid)
+        w = await tmux_manager.find_window_by_id(wid)
+        killed = bool(w) and await tmux_manager.kill_window(w.window_id)
+        if w and not killed:
+            await safe_edit(query, f"❌ Failed to kill window '{display}'.")
+            await query.answer()
+            return
+        session_manager.unbind_thread(user.id, cb_thread_id)
+        await clear_topic_state(user.id, cb_thread_id, context.bot, context.user_data)
+        logger.info(
+            "/kill: window %s %s (user=%d, thread=%d)",
+            display,
+            "killed" if killed else "already gone",
+            user.id,
+            cb_thread_id,
+        )
+        await safe_edit(
+            query,
+            f"✅ Window '{display}' killed.\nSend a message to bind this topic to a session."
+            if killed
+            else f"Window '{display}' was already gone. Binding removed.",
+        )
+        await query.answer()
+        return
+
     # History: older/newer pagination
     # Format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>
     if data.startswith(CB_HISTORY_PREV) or data.startswith(CB_HISTORY_NEXT):
@@ -1838,7 +1919,7 @@ async def post_init(application: Application) -> None:
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
-        BotCommand("kill", "Kill session and delete topic"),
+        BotCommand("kill", "Kill this topic's tmux window (asks first)"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
     ]
@@ -1915,6 +1996,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
+    application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
