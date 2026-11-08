@@ -198,7 +198,17 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
     top_idx: int | None = None
     bottom_idx: int | None = None
 
-    for i, line in enumerate(lines):
+    # Frames left by earlier runs can sit above the live one: only the last counts
+    first = 0
+    if pattern.at_end:
+        matches = [
+            i
+            for i, line in enumerate(lines)
+            if any(p.search(line) for p in pattern.top)
+        ]
+        first = matches[-1] if matches else 0
+
+    for i, line in enumerate(lines[first:], first):
         if top_idx is None:
             if any(p.search(line) for p in pattern.top):
                 top_idx = i
