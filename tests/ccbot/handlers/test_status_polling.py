@@ -143,9 +143,7 @@ class TestStatusPollerSettingsDetection:
 
 class TestStatuslineInStatusMessage:
     RULE = "─" * 40
-    PANE = "\n".join(
-        ["· Working… (3s)", RULE, "❯ ", RULE, "  ctx:██ `16%", "  ⏵⏵ auto mode on"]
-    )
+    PANE = f"· Working… (3s)\n{RULE}\n❯ \n{RULE}\n  ctx:██ `16%\n  ⏵⏵ auto mode on"
 
     async def _status_sent(self, pane: str, enabled: bool = True) -> str:
         window = MagicMock(window_id="@1", pane_current_command="claude")
@@ -177,7 +175,5 @@ class TestStatuslineInStatusMessage:
         assert await self._status_sent(self.PANE, enabled=False) == "Working… (3s)"
 
     async def test_no_statusline_leaves_the_status_alone(self) -> None:
-        pane = "\n".join(
-            ["· Working… (3s)", self.RULE, "❯ ", self.RULE, "  ⏵⏵ auto mode on"]
-        )
+        pane = f"· Working… (3s)\n{self.RULE}\n❯ \n{self.RULE}\n  ⏵⏵ auto mode on"
         assert await self._status_sent(pane) == "Working… (3s)"
