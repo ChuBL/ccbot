@@ -8,10 +8,11 @@ on its next 1s tick.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TimedOut
 
 from ccbot.handlers.status_polling import (
     _private_topic_deleted,
+    unbind_deleted_private_topics,
     update_status_message,
 )
 
@@ -165,3 +166,36 @@ class TestPrivateTopicProbe:
         await _private_topic_deleted(bot, 1, 2)
         reply = bot.send_message.call_args.kwargs["reply_parameters"]
         assert reply.allow_sending_without_reply is False
+
+    async def test_unbinds_only_the_deleted_private_topic(self) -> None:
+        bot = AsyncMock()
+
+        async def refuse(**kwargs) -> None:
+            gone = kwargs["message_thread_id"] == 5
+            raise BadRequest(
+                "Message thread not found"
+                if gone
+                else "Message to be replied not found"
+            )
+
+        bot.send_message.side_effect = refuse
+        with (
+            patch("ccbot.handlers.status_polling.session_manager") as sm,
+            patch(
+                "ccbot.handlers.status_polling.clear_topic_state", new=AsyncMock()
+            ) as clear,
+        ):
+            sm.iter_thread_bindings.return_value = [(1, 5, "@1"), (1, 6, "@2")]
+            sm.resolve_chat_id.return_value = 1
+            await unbind_deleted_private_topics(bot)
+        sm.unbind_thread.assert_called_once_with(1, 5)
+        clear.assert_awaited_once_with(1, 5, bot)
+
+    async def test_a_failed_probe_leaves_the_binding_alone(self) -> None:
+        bot = AsyncMock()
+        bot.send_message.side_effect = TimedOut("slow")
+        with patch("ccbot.handlers.status_polling.session_manager") as sm:
+            sm.iter_thread_bindings.return_value = [(1, 5, "@1")]
+            sm.resolve_chat_id.return_value = 1
+            await unbind_deleted_private_topics(bot)
+        sm.unbind_thread.assert_not_called()

@@ -195,6 +195,33 @@ async def _private_topic_deleted(bot: Bot, chat_id: int, thread_id: int) -> bool
     return False
 
 
+async def unbind_deleted_private_topics(bot: Bot) -> None:
+    """Free the windows of private-chat topics that no longer exist (local patch).
+
+    Only unbinds: a group topic whose chat id was lost resolves to the private chat
+    and looks deleted, so the window must survive a wrong answer here.
+    """
+    for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
+        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+        if chat_id <= 0:
+            continue
+        try:
+            if not await _private_topic_deleted(bot, chat_id, thread_id):
+                continue
+            session_manager.unbind_thread(user_id, thread_id)
+            await clear_topic_state(user_id, thread_id, bot)
+        except Exception as e:
+            logger.debug("Topic probe error for %s: %s", wid, e)
+            continue
+        logger.info(
+            "Topic deleted: unbound thread %d for user %d, "
+            "window_id '%s' can be picked again",
+            thread_id,
+            user_id,
+            wid,
+        )
+
+
 async def status_poll_loop(bot: Bot) -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
@@ -205,26 +232,14 @@ async def status_poll_loop(bot: Bot) -> None:
             now = time.monotonic()
             if now - last_topic_check >= TOPIC_CHECK_INTERVAL:
                 last_topic_check = now
+                await unbind_deleted_private_topics(bot)
                 for user_id, thread_id, wid in list(
                     session_manager.iter_thread_bindings()
                 ):
                     try:
                         chat_id = session_manager.resolve_chat_id(user_id, thread_id)
                         if chat_id > 0:
-                            # Local patch: a private-chat topic, see _private_topic_deleted.
-                            # Only unbinds: a group topic whose chat id was lost resolves
-                            # here too and looks deleted, so never kill the window on this.
-                            if await _private_topic_deleted(bot, chat_id, thread_id):
-                                session_manager.unbind_thread(user_id, thread_id)
-                                await clear_topic_state(user_id, thread_id, bot)
-                                logger.info(
-                                    "Topic deleted: unbound thread %d for user %d, "
-                                    "window_id '%s' can be picked again",
-                                    thread_id,
-                                    user_id,
-                                    wid,
-                                )
-                            continue
+                            continue  # Handled by unbind_deleted_private_topics
                         await bot.unpin_all_forum_topic_messages(
                             chat_id=chat_id,
                             message_thread_id=thread_id,

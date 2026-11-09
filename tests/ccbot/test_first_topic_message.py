@@ -18,18 +18,21 @@ def _update(text: str = "name of my topic") -> MagicMock:
 
 async def _send_first_text(windows: list, user_data: dict) -> tuple:
     context = MagicMock(user_data=user_data, bot=AsyncMock())
+    refresh = AsyncMock()
     with (
         patch.object(bot_mod, "is_user_allowed", return_value=True),
         patch.object(bot_mod, "_get_thread_id", return_value=7),
         patch.object(bot_mod, "session_manager") as sm,
         patch.object(bot_mod, "tmux_manager") as tm,
         patch.object(bot_mod, "safe_reply", new=AsyncMock()) as reply,
+        patch.object(bot_mod, "unbind_deleted_private_topics", new=refresh),
     ):
         sm.get_window_for_thread.return_value = None
         sm.iter_thread_bindings.return_value = []
         sm.send_to_window = AsyncMock()
         tm.list_windows = AsyncMock(return_value=windows)
         await bot_mod.text_handler(_update(), context)
+    refresh.assert_awaited_once_with(context.bot)
     return sm, reply
 
 

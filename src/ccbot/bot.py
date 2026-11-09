@@ -61,6 +61,7 @@ from telegram.ext import (
 
 from .config import config
 from .handlers.callback_data import (
+    CB_AGENT_OPEN,
     CB_ASK_DOWN,
     CB_ASK_ENTER,
     CB_ASK_ESC,
@@ -77,21 +78,21 @@ from .handlers.callback_data import (
     CB_DIR_UP,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
-    CB_AGENT_OPEN,
-    CB_SESSION_ALL,
-    CB_SESSION_CANCEL,
-    CB_SESSION_NEW,
-    CB_SESSION_SELECT,
     CB_KEYS_PREFIX,
     CB_KILL_NO,
     CB_KILL_YES,
     CB_SCREENSHOT_REFRESH,
+    CB_SESSION_ALL,
+    CB_SESSION_CANCEL,
+    CB_SESSION_NEW,
+    CB_SESSION_SELECT,
     CB_TRUST_NO,
     CB_TRUST_YES,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
 )
+from .handlers.cleanup import clear_topic_state
 from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
@@ -109,7 +110,6 @@ from .handlers.directory_browser import (
     clear_session_picker_state,
     clear_window_picker_state,
 )
-from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
@@ -139,9 +139,9 @@ from .handlers.message_sender import (
     safe_send,
     send_with_fallback,
 )
-from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
-from .handlers.status_polling import status_poll_loop
+from .handlers.status_polling import status_poll_loop, unbind_deleted_private_topics
+from .markdown_v2 import convert_markdown
 from .screenshot import text_to_image
 from .session import ClaudeSession, session_manager
 from .session_monitor import NewMessage, SessionMonitor
@@ -195,9 +195,11 @@ def _get_thread_id(update: Update) -> int | None:
 
 
 async def _open_topic_picker(
-    message: Message, user_data: dict | None, thread_id: int
+    bot: Bot, message: Message, user_data: dict | None, thread_id: int
 ) -> None:
     """Offer an unbound topic the free windows, or the directory browser if none are."""
+    # A deleted topic sends no event; don't wait for the poller to free its window
+    await unbind_deleted_private_topics(bot)
     all_windows = await tmux_manager.list_windows()
     bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
     unbound = [
@@ -239,7 +241,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         and thread_id is not None
         and session_manager.get_window_for_thread(user.id, thread_id) is None
     ):
-        await _open_topic_picker(update.message, context.user_data, thread_id)
+        await _open_topic_picker(
+            context.bot, update.message, context.user_data, thread_id
+        )
         return
 
     if update.message:
@@ -980,7 +984,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if wid is None:
         # Local patch: the first text opens the picker like /start and is not sent on.
         # It's there to name the topic, which iOS Telegram can't do afterwards.
-        await _open_topic_picker(update.message, context.user_data, thread_id)
+        await _open_topic_picker(
+            context.bot, update.message, context.user_data, thread_id
+        )
         return
 
     # Bound topic — forward to bound window
