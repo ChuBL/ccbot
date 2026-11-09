@@ -46,7 +46,6 @@ from .callback_data import (
     CB_TRUST_YES,
 )
 from .message_sender import NO_LINK_PREVIEW
-from .session_trash import claude_agents
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +95,23 @@ SHELLS = frozenset({"zsh", "bash", "sh", "dash", "fish"})
 AGENT_VIEW = "AgentView"
 _MAX_SESSION_BUTTONS = 8
 _PANE_WAIT_SECONDS = 15.0
+
+
+async def claude_agents() -> list[dict[str, str]] | None:
+    """Every session Claude Code has open; None if listing fails."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude",
+            "agents",
+            "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        return json.loads(stdout)
+    except (OSError, TimeoutError, ValueError) as e:
+        logger.warning("Could not list Claude Code sessions: %s", e)
+        return None
 
 
 async def list_background_sessions() -> list[dict[str, str]]:

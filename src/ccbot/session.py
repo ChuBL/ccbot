@@ -26,6 +26,7 @@ import fcntl
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Callable, Iterator
@@ -73,6 +74,10 @@ class WindowState:
         )
 
 
+# Local patch: how long a one-message session stays on the resume list
+_SHORT_SESSION_KEEP_SECONDS = 86400
+
+
 @dataclass
 class ClaudeSession:
     """Information about a Claude Code session."""
@@ -81,6 +86,8 @@ class ClaudeSession:
     summary: str
     message_count: int
     file_path: str
+    typed_messages: int = 0  # Local patch: what the user actually typed
+    hidden_by_default: bool = False  # Local patch: see list_sessions_for_directory
 
 
 @dataclass
@@ -728,6 +735,7 @@ class SessionManager:
         summary = ""
         last_user_msg = ""
         message_count = 0
+        typed_messages = 0
         try:
             async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
                 async for line in f:
@@ -754,6 +762,7 @@ class SessionManager:
                                 and parsed.text.strip()
                             ):
                                 last_user_msg = parsed.text.strip()
+                                typed_messages += 1
                     except json.JSONDecodeError:
                         continue
         except OSError:
@@ -767,6 +776,7 @@ class SessionManager:
             summary=summary,
             message_count=message_count,
             file_path=str(file_path),
+            typed_messages=typed_messages,
         )
 
     # --- Directory session listing ---
@@ -779,6 +789,10 @@ class SessionManager:
         extracts summary info from each.
 
         Returns a list sorted by mtime (most recent first), capped at 10.
+
+        Local patch: sessions older than a day where only one message was typed
+        are marked hidden_by_default and don't count toward the cap, so tests and
+        one-off questions don't push real work off the list.
         """
         encoded_cwd = self._encode_cwd(cwd)
         project_dir = config.claude_projects_path / encoded_cwd
@@ -794,34 +808,22 @@ class SessionManager:
 
         # Skip sessions-index and cap at 10
         sessions: list[ClaudeSession] = []
+        listed = 0
         for f in jsonl_files:
             if f.stem == "sessions-index":
                 continue
-            if len(sessions) >= 10:
+            if listed >= 10:
                 break
             session_id = f.stem
             session = await self._get_session_direct(session_id, cwd)
             # Local patch: "Untitled" means nothing was ever typed in it (opened and /exit)
             if session and session.message_count > 0 and session.summary != "Untitled":
+                session.hidden_by_default = (
+                    session.typed_messages <= 1
+                    and time.time() - f.stat().st_mtime > _SHORT_SESSION_KEEP_SECONDS
+                )
                 sessions.append(session)
-        return sessions
-
-    def trash_dir_for(self, cwd: str) -> Path:
-        """Where deleted sessions of this directory wait to be restored or purged."""
-        return config.config_dir / "trash" / self._encode_cwd(cwd)
-
-    async def list_trashed_sessions(self, cwd: str) -> list[ClaudeSession]:
-        """Deleted sessions of a directory, most recently deleted first, capped at 10."""
-        files = sorted(
-            self.trash_dir_for(cwd).glob("*.jsonl"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        sessions: list[ClaudeSession] = []
-        for f in files[:10]:
-            session = await self._read_session_file(f.stem, f)
-            if session:
-                sessions.append(session)
+                listed += not session.hidden_by_default
         return sessions
 
     # --- Window → Session resolution ---

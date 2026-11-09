@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ccbot.handlers.status_polling import update_status_message
+from telegram.error import BadRequest
+
+from ccbot.handlers.status_polling import (
+    _private_topic_deleted,
+    update_status_message,
+)
 
 
 @pytest.fixture
@@ -139,3 +144,25 @@ class TestStatusPollerSettingsDetection:
             assert keyboard is not None
             # Verify the message text contains model picker content
             assert "Select model" in call_kwargs["text"]
+
+
+class TestPrivateTopicProbe:
+    @pytest.mark.parametrize(
+        ("error", "deleted"),
+        [
+            ("Message thread not found", True),
+            ("Message to be replied not found", False),
+            ("Too many open files", False),
+        ],
+    )
+    async def test_reads_telegrams_refusal(self, error: str, deleted: bool) -> None:
+        bot = AsyncMock()
+        bot.send_message.side_effect = BadRequest(error)
+        assert await _private_topic_deleted(bot, 1, 2) is deleted
+
+    async def test_the_probe_can_never_be_delivered(self) -> None:
+        bot = AsyncMock()
+        bot.send_message.side_effect = BadRequest("Message to be replied not found")
+        await _private_topic_deleted(bot, 1, 2)
+        reply = bot.send_message.call_args.kwargs["reply_parameters"]
+        assert reply.allow_sending_without_reply is False

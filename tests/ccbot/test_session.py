@@ -1,6 +1,8 @@
 """Tests for SessionManager pure dict operations."""
 
 import json
+import time
+import os
 
 import pytest
 
@@ -390,3 +392,41 @@ class TestResumeList:
         self._write(tmp_path, monkeypatch, [self._user("real prompt"), *_EXIT_ENTRIES])
         sessions = await mgr.list_sessions_for_directory("/work/app")
         assert [s.summary for s in sessions] == ["real prompt"]
+
+    async def test_one_message_session_hides_once_a_day_old(
+        self, mgr, tmp_path, monkeypatch
+    ) -> None:
+        self._write(tmp_path, monkeypatch, [self._user("one question")])
+        [fresh] = await mgr.list_sessions_for_directory("/work/app")
+        assert not fresh.hidden_by_default
+
+        day_and_a_bit = time.time() - 90000
+        os.utime(fresh.file_path, (day_and_a_bit, day_and_a_bit))
+        [old] = await mgr.list_sessions_for_directory("/work/app")
+        assert old.hidden_by_default
+
+    async def test_longer_old_session_stays_visible(
+        self, mgr, tmp_path, monkeypatch
+    ) -> None:
+        self._write(tmp_path, monkeypatch, [self._user("a"), self._user("b")])
+        [session] = await mgr.list_sessions_for_directory("/work/app")
+        os.utime(session.file_path, (1, 1))
+        [session] = await mgr.list_sessions_for_directory("/work/app")
+        assert session.typed_messages == 2 and not session.hidden_by_default
+
+    async def test_hidden_sessions_do_not_use_up_the_cap(
+        self, mgr, tmp_path, monkeypatch
+    ) -> None:
+        project = tmp_path / "-work-app"
+        project.mkdir()
+        monkeypatch.setattr(session_mod.config, "claude_projects_path", tmp_path)
+        entries = [self._user("first"), self._user("second")]
+        for i in range(12):
+            body = entries if i >= 2 else entries[:1]
+            path = project / f"{i:08d}-2222-3333-4444-555555555555.jsonl"
+            path.write_text("\n".join(json.dumps(e) for e in body) + "\n")
+            # The two one-message sessions are the newest of the old ones
+            os.utime(path, (1000 - i * (1 if i < 2 else 2),) * 2)
+        found = await mgr.list_sessions_for_directory("/work/app")
+        assert sum(not s.hidden_by_default for s in found) == 10
+        assert sum(s.hidden_by_default for s in found) == 2

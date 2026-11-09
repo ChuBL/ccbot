@@ -77,19 +77,14 @@ from .handlers.callback_data import (
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
     CB_AGENT_OPEN,
-    CB_SESSION_BACK,
+    CB_SESSION_ALL,
     CB_SESSION_CANCEL,
-    CB_SESSION_DEL,
-    CB_SESSION_DEL_MODE,
-    CB_SESSION_DEL_OK,
     CB_SESSION_NEW,
-    CB_SESSION_RESTORE,
     CB_SESSION_SELECT,
     CB_KEYS_PREFIX,
     CB_KILL_NO,
     CB_KILL_YES,
     CB_SCREENSHOT_REFRESH,
-    CB_SESSION_TRASH,
     CB_TRUST_NO,
     CB_TRUST_YES,
     CB_WIN_BIND,
@@ -100,9 +95,6 @@ from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
-    PICKER_DELETE,
-    PICKER_RESUME,
-    PICKER_TRASH,
     SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
@@ -110,7 +102,6 @@ from .handlers.directory_browser import (
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
     build_directory_browser,
-    build_session_delete_confirm,
     build_session_picker,
     build_window_picker,
     clear_browse_state,
@@ -118,7 +109,6 @@ from .handlers.directory_browser import (
     clear_window_picker_state,
 )
 from .handlers.cleanup import clear_topic_state
-from .handlers.session_trash import restore_session, trash_session
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
@@ -154,7 +144,7 @@ from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
-from .session import session_manager
+from .session import ClaudeSession, session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import (
     extract_bash_output,
@@ -1126,21 +1116,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _show_session_picker(
     query: CallbackQuery,
     user_data: dict,
-    cwd: str,
-    mode: str = PICKER_RESUME,
+    found: list[ClaudeSession],
+    show_all: bool = False,
 ) -> None:
-    """Redraw the session picker from what is on disk now."""
-    sessions = await session_manager.list_sessions_for_directory(cwd)
-    trashed = await session_manager.list_trashed_sessions(cwd)
-    user_data[SESSIONS_KEY] = sessions
-    if (mode == PICKER_TRASH and not trashed) or (
-        mode == PICKER_DELETE and not sessions
-    ):
-        mode = PICKER_RESUME
+    """Draw the session picker; short old sessions wait behind a button (local patch)."""
+    shown = found[:10] if show_all else [s for s in found if not s.hidden_by_default]
+    user_data[SESSIONS_KEY] = shown
     text, keyboard = build_session_picker(
-        trashed if mode == PICKER_TRASH else sessions,
-        mode=mode,
-        has_trash=bool(trashed),
+        shown, hidden=0 if show_all else len(found) - len(shown)
     )
     await safe_edit(query, text, reply_markup=keyboard)
 
@@ -1574,12 +1557,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Check for existing sessions in this directory
         sessions = await session_manager.list_sessions_for_directory(selected_path)
-        trashed = await session_manager.list_trashed_sessions(selected_path)
-        if (sessions or trashed) and context.user_data is not None:
+        if sessions and context.user_data is not None:
             # Show session picker — store state for later
             context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
             context.user_data["_selected_path"] = selected_path
-            await _show_session_picker(query, context.user_data, selected_path)
+            await _show_session_picker(query, context.user_data, sessions)
             await query.answer()
             return
 
@@ -1646,10 +1628,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             resume_session_id=session.session_id,
         )
 
-    # Session picker: delete and restore (local patch)
-    elif data in (CB_SESSION_DEL_MODE, CB_SESSION_BACK, CB_SESSION_TRASH) or (
-        data.startswith((CB_SESSION_DEL, CB_SESSION_DEL_OK, CB_SESSION_RESTORE))
-    ):
+    # Session picker: reveal the short old sessions (local patch)
+    elif data == CB_SESSION_ALL:
         user_data = context.user_data
         if user_data is None or SESSIONS_KEY not in user_data:
             await query.answer("This list has expired.", show_alert=True)
@@ -1659,37 +1639,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         cwd = user_data.get("_selected_path", str(Path.cwd()))
-        if data in (CB_SESSION_DEL_MODE, CB_SESSION_BACK, CB_SESSION_TRASH):
-            mode = {
-                CB_SESSION_DEL_MODE: PICKER_DELETE,
-                CB_SESSION_TRASH: PICKER_TRASH,
-            }.get(data, PICKER_RESUME)
-            await _show_session_picker(query, user_data, cwd, mode)
-            await query.answer()
-            return
-        if data.startswith(CB_SESSION_RESTORE):
-            ok, result = await restore_session(cwd, data[len(CB_SESSION_RESTORE) :])
-            if ok:
-                await _show_session_picker(query, user_data, cwd, PICKER_TRASH)
-            await query.answer(result, show_alert=not ok)
-            return
-        confirmed = data.startswith(CB_SESSION_DEL_OK)
-        wanted_id = data[len(CB_SESSION_DEL_OK if confirmed else CB_SESSION_DEL) :]
-        session = next(
-            (s for s in user_data[SESSIONS_KEY] if s.session_id == wanted_id), None
-        )
-        if session is None:
-            await query.answer("This list has expired.", show_alert=True)
-            return
-        if not confirmed:
-            text, keyboard = build_session_delete_confirm(session)
-            await safe_edit(query, text, reply_markup=keyboard)
-            await query.answer()
-            return
-        ok, result = await trash_session(session.session_id, session.file_path)
-        if ok:
-            await _show_session_picker(query, user_data, cwd, PICKER_DELETE)
-        await query.answer(result, show_alert=not ok)
+        found = await session_manager.list_sessions_for_directory(cwd)
+        await _show_session_picker(query, user_data, found, show_all=True)
+        await query.answer()
 
     elif data == CB_SESSION_NEW:
         pending_tid = (

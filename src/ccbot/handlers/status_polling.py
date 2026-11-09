@@ -22,7 +22,7 @@ import logging
 import re
 import time
 
-from telegram import Bot
+from telegram import Bot, ReplyParameters
 from telegram.error import BadRequest
 
 from ..session import session_manager
@@ -36,7 +36,6 @@ from .interactive_ui import (
     handle_interactive_ui,
     release_held_text,
 )
-from .session_trash import purge_trash
 from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_message_queue
 
@@ -48,8 +47,8 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
 
-# Local patch: how often to look for trashed sessions past their 30 days
-TRASH_PURGE_INTERVAL = 3600.0  # seconds
+# Local patch: a message id no chat has, for _private_topic_deleted
+_NO_SUCH_MESSAGE_ID = 2147483000
 
 # Local patch: pass on the "claude --resume" line Claude Code prints when it quits.
 # Anchored to the start of a line because the same words can be quoted inside a conversation.
@@ -175,26 +174,61 @@ async def update_status_message(
     # If no status line, keep existing status message (don't clear on transient state)
 
 
+async def _private_topic_deleted(bot: Bot, chat_id: int, thread_id: int) -> bool:
+    """Whether a private-chat topic is gone (local patch).
+
+    unpin_all_forum_topic_messages succeeds there even for a topic that never
+    existed. A reply to a message that doesn't exist is always refused, so nothing
+    is ever sent, and Telegram checks the topic before it checks the message.
+    """
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=".",
+            disable_notification=True,
+            reply_parameters=ReplyParameters(
+                message_id=_NO_SUCH_MESSAGE_ID,
+                allow_sending_without_reply=False,
+            ),
+        )
+    except BadRequest as e:
+        return "message thread not found" in str(e).lower()
+    return False
+
+
 async def status_poll_loop(bot: Bot) -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
     last_topic_check = 0.0
-    last_trash_purge = 0.0
     while True:
         try:
             # Periodic topic existence probe
             now = time.monotonic()
-            if now - last_trash_purge >= TRASH_PURGE_INTERVAL:
-                last_trash_purge = now
-                await asyncio.to_thread(purge_trash)
             if now - last_topic_check >= TOPIC_CHECK_INTERVAL:
                 last_topic_check = now
                 for user_id, thread_id, wid in list(
                     session_manager.iter_thread_bindings()
                 ):
                     try:
+                        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+                        if chat_id > 0:
+                            # Local patch: a private-chat topic, see _private_topic_deleted.
+                            # Only unbinds: a group topic whose chat id was lost resolves
+                            # here too and looks deleted, so never kill the window on this.
+                            if await _private_topic_deleted(bot, chat_id, thread_id):
+                                session_manager.unbind_thread(user_id, thread_id)
+                                await clear_topic_state(user_id, thread_id, bot)
+                                logger.info(
+                                    "Topic deleted: unbound thread %d for user %d, "
+                                    "window_id '%s' can be picked again",
+                                    thread_id,
+                                    user_id,
+                                    wid,
+                                )
+                            continue
                         await bot.unpin_all_forum_topic_messages(
-                            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
+                            chat_id=chat_id,
                             message_thread_id=thread_id,
                         )
                     except BadRequest as e:
