@@ -31,7 +31,7 @@ async def clear_topic_state(
       - _status_msg_info (status message tracking)
       - _tool_msg_ids (tool_use → message_id mapping)
       - _interactive_msgs and _interactive_mode (interactive UI state)
-      - user_data pending state (_pending_thread_id, _pending_thread_text)
+      - user_data pending state (_pending_thread_id)
     """
     # Clear status message tracking
     clear_status_msg_info(user_id, thread_id)
@@ -46,4 +46,3 @@ async def clear_topic_state(
     if user_data is not None:
         if user_data.get("_pending_thread_id") == thread_id:
             user_data.pop("_pending_thread_id", None)
-            user_data.pop("_pending_thread_text", None)

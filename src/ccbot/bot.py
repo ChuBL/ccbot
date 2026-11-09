@@ -39,12 +39,13 @@ import time
 from pathlib import Path
 
 from telegram import (
-    CallbackQuery,
     Bot,
     BotCommand,
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
+    Message,
     Update,
 )
 from telegram.constants import ChatAction
@@ -112,7 +113,6 @@ from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
-    SHELLS,
     TRUST_DIALOG,
     answer_trust_dialog,
     clear_interactive_mode,
@@ -121,7 +121,6 @@ from .handlers.interactive_ui import (
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
-    hold_text,
     open_background_session,
     send_window_snapshot,
     set_interactive_mode,
@@ -195,6 +194,35 @@ def _get_thread_id(update: Update) -> int | None:
 # --- Command handlers ---
 
 
+async def _open_topic_picker(
+    message: Message, user_data: dict | None, thread_id: int
+) -> None:
+    """Offer an unbound topic the free windows, or the directory browser if none are."""
+    all_windows = await tmux_manager.list_windows()
+    bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
+    unbound = [
+        (w.window_id, w.window_name, w.cwd, w.pane_current_command)
+        for w in all_windows
+        if w.window_id not in bound_ids
+    ]
+    if unbound:
+        msg_text, keyboard, win_ids = build_window_picker(unbound)
+        if user_data is not None:
+            user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+            user_data[UNBOUND_WINDOWS_KEY] = win_ids
+    else:
+        start_path = str(Path.cwd())
+        msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        if user_data is not None:
+            user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            user_data[BROWSE_PATH_KEY] = start_path
+            user_data[BROWSE_PAGE_KEY] = 0
+            user_data[BROWSE_DIRS_KEY] = subdirs
+    if user_data is not None:
+        user_data["_pending_thread_id"] = thread_id
+    await safe_reply(message, msg_text, reply_markup=keyboard)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -204,37 +232,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     clear_browse_state(context.user_data)
 
-    # Local patch: in an unbound topic /start opens the picker, with no text to forward after binding
+    # Local patch: in an unbound topic /start opens the picker
     thread_id = _get_thread_id(update)
     if (
         update.message
         and thread_id is not None
         and session_manager.get_window_for_thread(user.id, thread_id) is None
     ):
-        all_windows = await tmux_manager.list_windows()
-        bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
-        unbound = [
-            (w.window_id, w.window_name, w.cwd, w.pane_current_command)
-            for w in all_windows
-            if w.window_id not in bound_ids
-        ]
-        if unbound:
-            msg_text, keyboard, win_ids = build_window_picker(unbound)
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
-        else:
-            start_path = str(Path.cwd())
-            msg_text, keyboard, subdirs = build_directory_browser(start_path)
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-                context.user_data[BROWSE_PATH_KEY] = start_path
-                context.user_data[BROWSE_PAGE_KEY] = 0
-                context.user_data[BROWSE_DIRS_KEY] = subdirs
-        if context.user_data is not None:
-            context.user_data["_pending_thread_id"] = thread_id
-            context.user_data.pop("_pending_thread_text", None)
-        await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        await _open_topic_picker(update.message, context.user_data, thread_id)
         return
 
     if update.message:
@@ -929,7 +934,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Stale picker state from a different thread — clear it
         clear_window_picker_state(context.user_data)
         context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
 
     # Ignore text in directory browsing mode (only for the same thread)
     if (
@@ -946,7 +950,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Stale browsing state from a different thread — clear it
         clear_browse_state(context.user_data)
         context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
 
     # Ignore text in session picker mode (only for the same thread)
     if (
@@ -963,7 +966,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Stale picker state from a different thread — clear it
         clear_session_picker_state(context.user_data)
         context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
         context.user_data.pop("_selected_path", None)
 
     # Must be in a named topic
@@ -976,54 +978,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
-        # Unbound topic — check for unbound windows first
-        all_windows = await tmux_manager.list_windows()
-        bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
-        unbound = [
-            (w.window_id, w.window_name, w.cwd, w.pane_current_command)
-            for w in all_windows
-            if w.window_id not in bound_ids
-        ]
-        logger.debug(
-            "Window picker check: all=%s, bound=%s, unbound=%s",
-            [w.window_name for w in all_windows],
-            bound_ids,
-            [name for _, name, _, _ in unbound],
-        )
-
-        if unbound:
-            # Show window picker
-            logger.info(
-                "Unbound topic: showing window picker (%d unbound windows, user=%d, thread=%d)",
-                len(unbound),
-                user.id,
-                thread_id,
-            )
-            msg_text, keyboard, win_ids = build_window_picker(unbound)
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
-                context.user_data["_pending_thread_id"] = thread_id
-                context.user_data["_pending_thread_text"] = text
-            await safe_reply(update.message, msg_text, reply_markup=keyboard)
-            return
-
-        # No unbound windows — show directory browser to create a new session
-        logger.info(
-            "Unbound topic: showing directory browser (user=%d, thread=%d)",
-            user.id,
-            thread_id,
-        )
-        start_path = str(Path.cwd())
-        msg_text, keyboard, subdirs = build_directory_browser(start_path)
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
-            context.user_data["_pending_thread_id"] = thread_id
-            context.user_data["_pending_thread_text"] = text
-        await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        # Local patch: the first text opens the picker like /start and is not sent on.
+        # It's there to name the topic, which iOS Telegram can't do afterwards.
+        await _open_topic_picker(update.message, context.user_data, thread_id)
         return
 
     # Bound topic — forward to bound window
@@ -1128,16 +1085,6 @@ async def _show_session_picker(
     await safe_edit(query, text, reply_markup=keyboard)
 
 
-async def _startup_prompt_showing(window_id: str, timeout: float = 8.0) -> bool:
-    """Wait briefly for a prompt that holds up Claude Code's start."""
-    for _ in range(int(timeout / 0.5)):
-        pane_text = await tmux_manager.capture_pane(window_id)
-        if pane_text and is_interactive_ui(pane_text):
-            return True
-        await asyncio.sleep(0.5)
-    return False
-
-
 async def _create_and_bind_window(
     query: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1225,43 +1172,7 @@ async def _create_and_bind_window(
                 f"✅ {message}\n\n{status}. Send messages here.",
             )
 
-            # Send pending text if any
-            pending_text = (
-                context.user_data.get("_pending_thread_text")
-                if context.user_data
-                else None
-            )
-            if pending_text:
-                logger.debug(
-                    "Forwarding pending text to window %s (len=%d)",
-                    created_wname,
-                    len(pending_text),
-                )
-                if context.user_data is not None:
-                    context.user_data.pop("_pending_thread_text", None)
-                    context.user_data.pop("_pending_thread_id", None)
-                # Local patch: with no SessionStart yet, something is on screen ahead of
-                # Claude Code, and the text would answer it
-                if not hook_ok and await _startup_prompt_showing(created_wid):
-                    hold_text(created_wid, user.id, pending_thread_id, pending_text)
-                    send_ok, send_msg = True, ""
-                else:
-                    send_ok, send_msg = await session_manager.send_to_window(
-                        created_wid,
-                        pending_text,
-                    )
-                if not send_ok:
-                    logger.warning("Failed to forward pending text: %s", send_msg)
-                    resolved_chat = session_manager.resolve_chat_id(
-                        user.id, pending_thread_id
-                    )
-                    await safe_send(
-                        context.bot,
-                        resolved_chat,
-                        f"❌ Failed to send pending message: {send_msg}",
-                        message_thread_id=pending_thread_id,
-                    )
-            elif context.user_data is not None:
+            if context.user_data is not None:
                 context.user_data.pop("_pending_thread_id", None)
         else:
             # Should not happen in topic-only mode, but handle gracefully
@@ -1270,7 +1181,6 @@ async def _create_and_bind_window(
         await safe_edit(query, f"❌ {message}")
         if pending_thread_id is not None and context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
     await query.answer("Created" if success else "Failed")
 
 
@@ -1549,7 +1459,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             clear_browse_state(context.user_data)
             if context.user_data is not None:
                 context.user_data.pop("_pending_thread_id", None)
-                context.user_data.pop("_pending_thread_text", None)
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
 
@@ -1580,7 +1489,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         clear_browse_state(context.user_data)
         if context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
@@ -1673,7 +1581,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         clear_session_picker_state(context.user_data)
         if context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
             context.user_data.pop("_selected_path", None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
@@ -1726,38 +1633,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # Local patch: show what this window is running and has on screen
         await send_window_snapshot(context.bot, user.id, selected_wid, thread_id)
 
-        # Forward pending text if any
-        pending_text = (
-            context.user_data.get("_pending_thread_text") if context.user_data else None
-        )
         if context.user_data is not None:
-            context.user_data.pop("_pending_thread_text", None)
             context.user_data.pop("_pending_thread_id", None)
-        # Local patch: the message that opened the picker was meant for Claude Code,
-        # not for a shell or for whatever prompt is on screen
-        pane_text = await tmux_manager.capture_pane(selected_wid) or ""
-        if pending_text and (
-            w.pane_current_command in SHELLS or is_interactive_ui(pane_text)
-        ):
-            await safe_send(
-                context.bot,
-                session_manager.resolve_chat_id(user.id, thread_id),
-                "⚠️ Your first message was not sent to this window. Send it again if you want it there.",
-                message_thread_id=thread_id,
-            )
-        elif pending_text:
-            send_ok, send_msg = await session_manager.send_to_window(
-                selected_wid, pending_text
-            )
-            if not send_ok:
-                logger.warning("Failed to forward pending text: %s", send_msg)
-                resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
-                await safe_send(
-                    context.bot,
-                    resolved_chat,
-                    f"❌ Failed to send pending message: {send_msg}",
-                    message_thread_id=thread_id,
-                )
         await query.answer("Bound")
 
     # Window picker: new session → transition to directory browser
@@ -1791,7 +1668,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         clear_window_picker_state(context.user_data)
         if context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 

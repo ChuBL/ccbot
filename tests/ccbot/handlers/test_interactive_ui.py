@@ -4,17 +4,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ccbot.handlers.interactive_ui import (
-    _build_interactive_keyboard,
-    _held_text,
-    _awaiting_ready,
-    announce_ready,
-    expect_ready,
-    answer_trust_dialog,
-    handle_interactive_ui,
-    hold_text,
-    release_held_text,
-)
 from ccbot.handlers.callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -24,6 +13,14 @@ from ccbot.handlers.callback_data import (
     CB_ASK_SPACE,
     CB_ASK_TAB,
     CB_ASK_UP,
+)
+from ccbot.handlers.interactive_ui import (
+    _awaiting_ready,
+    _build_interactive_keyboard,
+    announce_ready,
+    answer_trust_dialog,
+    expect_ready,
+    handle_interactive_ui,
 )
 
 
@@ -162,37 +159,6 @@ class TestAnswerTrustDialog:
             ok, _ = await answer_trust_dialog("@1", True)
         assert not ok
         assert self._keys(tmux) == []
-
-
-class TestHeldText:
-    @pytest.fixture(autouse=True)
-    def _held(self):
-        _held_text.clear()
-        hold_text("@1", 1, 7, "hello")
-        yield
-        _held_text.clear()
-
-    async def test_waits_while_a_prompt_is_up(self, mock_bot) -> None:
-        pane = " Accessing workspace:\n x\n y\n Enter to confirm · Esc to cancel\n"
-        await release_held_text(mock_bot, "@1", "claude", pane)
-        assert "@1" in _held_text
-
-    async def test_dropped_with_a_notice_at_the_shell(self, mock_bot) -> None:
-        with patch("ccbot.handlers.interactive_ui.session_manager") as sm:
-            sm.resolve_chat_id.return_value = 1
-            sm.send_to_window = AsyncMock()
-            await release_held_text(mock_bot, "@1", "zsh", "user@host ➜")
-        mock_bot.send_message.assert_awaited_once()
-        sm.send_to_window.assert_not_awaited()
-        assert "@1" not in _held_text
-
-    async def test_sent_once_claude_code_is_up(self, mock_bot) -> None:
-        with patch("ccbot.handlers.interactive_ui.session_manager") as sm:
-            sm.get_window_state.return_value.session_id = "sid"
-            sm.send_to_window = AsyncMock()
-            await release_held_text(mock_bot, "@1", "claude", "❯ ")
-        sm.send_to_window.assert_awaited_once_with("@1", "hello")
-        assert "@1" not in _held_text
 
 
 class TestAnnounceReady:

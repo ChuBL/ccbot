@@ -35,7 +35,6 @@ from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
     handle_interactive_ui,
-    release_held_text,
 )
 from .message_queue import enqueue_status_update, get_message_queue
 
@@ -126,7 +125,6 @@ async def update_status_message(
         bot, user_id, window_id, thread_id, w.pane_current_command, pane_text
     )
     await announce_ready(bot, window_id, w.pane_current_command, pane_text)
-    await release_held_text(bot, window_id, w.pane_current_command, pane_text)
 
     interactive_window = get_interactive_window(user_id, thread_id)
     should_check_new_ui = True

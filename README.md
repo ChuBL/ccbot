@@ -171,10 +171,10 @@ Any unrecognized `/command` is also forwarded to Claude Code as-is (e.g. `/revie
 **Creating a new session:**
 
 1. Create a new topic in the Telegram group
-2. Send any message in the topic
+2. Send any text in the topic. It only names the topic and opens the picker; it is not sent to Claude Code
 3. A directory browser appears — select the project directory
 4. If the directory has existing Claude sessions, a session picker appears — choose one to resume or start fresh
-5. A tmux window is created, `claude` starts (with `--resume` if resuming), and your pending message is forwarded
+5. A tmux window is created, `claude` starts (with `--resume` if resuming)
 
 **Sending messages:**
 

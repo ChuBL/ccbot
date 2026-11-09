@@ -128,34 +128,7 @@ TRUST_DIALOG = "TrustDialog"
 _TRUST_MOVE_TRIES = 15
 _SNAPSHOT_LINES = 30
 _SNAPSHOT_MAX_CHARS = 3500
-# window_id -> (user_id, thread_id, text): first message waiting for the dialog to be answered
-_held_text: dict[str, tuple[int, int | None, str]] = {}
 _READY_TIMEOUT_SECONDS = 15.0
-
-
-def hold_text(window_id: str, user_id: int, thread_id: int | None, text: str) -> None:
-    """Keep a message back until the prompt on screen has been answered."""
-    _held_text[window_id] = (user_id, thread_id, text)
-
-
-async def release_held_text(
-    bot: Bot, window_id: str, pane_command: str, pane_text: str
-) -> None:
-    """Send a held message once Claude Code is up, or say it was dropped."""
-    held = _held_text.get(window_id)
-    if not held or is_interactive_ui(pane_text):
-        return
-    user_id, thread_id, text = held
-    if pane_command in SHELLS:
-        del _held_text[window_id]
-        await bot.send_message(
-            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
-            message_thread_id=thread_id,
-            text="⚠️ Claude Code is not running, so your first message was not sent.",
-        )
-    elif session_manager.get_window_state(window_id).session_id:
-        del _held_text[window_id]
-        await session_manager.send_to_window(window_id, text)
 
 
 # window_id -> (user_id, thread_id, session id before the trust answer, give-up time)
