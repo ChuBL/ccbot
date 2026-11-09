@@ -28,15 +28,15 @@ from telegram.error import BadRequest
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
 from ..tmux_manager import tmux_manager
+from .cleanup import clear_topic_state
 from .interactive_ui import (
-    announce_ready,
     SHELLS,
+    announce_ready,
     clear_interactive_msg,
     get_interactive_window,
     handle_interactive_ui,
     release_held_text,
 )
-from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_message_queue
 
 logger = logging.getLogger(__name__)

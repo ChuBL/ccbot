@@ -1,8 +1,8 @@
 """Tests for SessionManager pure dict operations."""
 
 import json
-import time
 import os
+import time
 
 import pytest
 
@@ -426,7 +426,7 @@ class TestResumeList:
             path = project / f"{i:08d}-2222-3333-4444-555555555555.jsonl"
             path.write_text("\n".join(json.dumps(e) for e in body) + "\n")
             # The two one-message sessions are the newest of the old ones
-            os.utime(path, (1000 - i * (1 if i < 2 else 2),) * 2)
+            os.utime(path, (1000 - i, 1000 - i))
         found = await mgr.list_sessions_for_directory("/work/app")
         assert sum(not s.hidden_by_default for s in found) == 10
         assert sum(s.hidden_by_default for s in found) == 2

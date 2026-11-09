@@ -8,7 +8,6 @@ on its next 1s tick.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from telegram.error import BadRequest
 
 from ccbot.handlers.status_polling import (
