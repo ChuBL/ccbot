@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telegram.error import BadRequest, TimedOut
 
+from ccbot.handlers import message_queue
 from ccbot.handlers.status_polling import (
     _private_topic_deleted,
     unbind_deleted_private_topics,
@@ -205,11 +206,16 @@ class TestStatuslineInStatusMessage:
     RULE = "─" * 40
     PANE = f"· Working… (3s)\n{RULE}\n❯ \n{RULE}\n  ctx:██ `16%\n  ⏵⏵ auto mode on"
 
-    async def _status_sent(self, pane: str, enabled: bool = True) -> str:
+    async def _status_sent(
+        self, pane: str, enabled: bool = True, shown: bool = False
+    ) -> str | None:
         window = MagicMock(window_id="@1", pane_current_command="claude")
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as tm,
-            patch("ccbot.handlers.status_polling.config") as cfg,
+            patch("ccbot.handlers.message_queue.config") as cfg,
+            patch(
+                "ccbot.handlers.status_polling.is_showing_only_statusline"
+            ) as only_bar,
             patch(
                 "ccbot.handlers.status_polling.enqueue_status_update",
                 new=AsyncMock(),
@@ -227,10 +233,11 @@ class TestStatuslineInStatusMessage:
             patch("ccbot.handlers.status_polling.announce_ready", new=AsyncMock()),
         ):
             cfg.show_statusline = enabled
+            only_bar.return_value = shown
             tm.find_window_by_id = AsyncMock(return_value=window)
             tm.capture_pane = AsyncMock(return_value=pane)
             await update_status_message(AsyncMock(), 1, "@1", thread_id=7)
-        return enqueue.await_args.args[3]
+        return enqueue.await_args.args[3] if enqueue.await_args else "not sent"
 
     async def test_added_below_the_spinner_as_code(self) -> None:
         assert await self._status_sent(self.PANE) == "Working… (3s)\n`ctx:██ '16%`"
@@ -241,3 +248,41 @@ class TestStatuslineInStatusMessage:
     async def test_no_statusline_leaves_the_status_alone(self) -> None:
         pane = f"· Working… (3s)\n{self.RULE}\n❯ \n{self.RULE}\n  ⏵⏵ auto mode on"
         assert await self._status_sent(pane) == "Working… (3s)"
+
+    async def test_kept_on_its_own_while_idle(self) -> None:
+        pane = f"Done.\n{self.RULE}\n❯ \n{self.RULE}\n  ctx:██ 16%\n  ⏵⏵ auto mode on"
+        assert await self._status_sent(pane) == "`ctx:██ 16%`"
+
+    async def test_cleared_once_claude_code_has_exited(self) -> None:
+        assert await self._status_sent("$ ", shown=True) is None
+
+    async def test_a_working_status_survives_a_blank_moment(self) -> None:
+        assert await self._status_sent("$ ", shown=False) == "not sent"
+
+
+class TestStatuslineMessage:
+    @pytest.mark.parametrize(
+        ("text", "silent"),
+        [("`ctx:██ 16%`", True), ("Working… (3s)\n`ctx:██ 16%`", False)],
+    )
+    async def test_only_the_idle_one_is_silent(self, text: str, silent: bool) -> None:
+        bot = AsyncMock()
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback", new=AsyncMock()
+            ) as send,
+        ):
+            sm.resolve_chat_id.return_value = 1
+            await message_queue._do_send_status_message(bot, 1, 7, "@1", text)
+        assert send.await_args.kwargs["disable_notification"] is silent
+        message_queue._status_msg_info.clear()
+
+    async def test_status_messages_are_removed_on_stop(self) -> None:
+        bot = AsyncMock()
+        message_queue._status_msg_info[(1, 7)] = (99, "@1", "`bar`")
+        with patch("ccbot.handlers.message_queue.session_manager") as sm:
+            sm.resolve_chat_id.return_value = 1
+            await message_queue.delete_status_messages(bot)
+        bot.delete_message.assert_awaited_once_with(chat_id=1, message_id=99)
+        assert not message_queue._status_msg_info

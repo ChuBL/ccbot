@@ -128,6 +128,7 @@ from .handlers.interactive_ui import (
 from .handlers.message_queue import (
     clear_status_msg_info,
     enqueue_content_message,
+    delete_status_messages,
     enqueue_status_update,
     get_message_queue,
     shutdown_workers,
@@ -2028,7 +2029,8 @@ async def post_init(application: Application) -> None:
     logger.info("Status polling task started")
 
 
-async def post_shutdown(application: Application) -> None:
+async def post_stop(application: Application) -> None:
+    """Stop what updates status messages, while the bot can still delete them."""
     global _status_poll_task
 
     # Stop status polling
@@ -2044,6 +2046,10 @@ async def post_shutdown(application: Application) -> None:
     # Stop all queue workers
     await shutdown_workers()
 
+    await delete_status_messages(application.bot)
+
+
+async def post_shutdown(application: Application) -> None:
     if session_monitor:
         session_monitor.stop()
         logger.info("Session monitor stopped")
@@ -2057,6 +2063,7 @@ def create_bot() -> Application:
         .token(config.telegram_bot_token)
         .rate_limiter(AIORateLimiter(max_retries=5))
         .post_init(post_init)
+        .post_stop(post_stop)
         .post_shutdown(post_shutdown)
         .build()
     )

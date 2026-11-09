@@ -25,13 +25,8 @@ import time
 from telegram import Bot, ReplyParameters
 from telegram.error import BadRequest
 
-from ..config import config
 from ..session import session_manager
-from ..terminal_parser import (
-    is_interactive_ui,
-    parse_custom_statusline,
-    parse_status_line,
-)
+from ..terminal_parser import is_interactive_ui
 from ..tmux_manager import tmux_manager
 from .cleanup import clear_topic_state
 from .interactive_ui import (
@@ -41,7 +36,12 @@ from .interactive_ui import (
     get_interactive_window,
     handle_interactive_ui,
 )
-from .message_queue import enqueue_status_update, get_message_queue
+from .message_queue import (
+    build_status_text,
+    enqueue_status_update,
+    get_message_queue,
+    is_showing_only_statusline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -164,22 +164,18 @@ async def update_status_message(
     if skip_status:
         return
 
-    status_line = parse_status_line(pane_text)
+    status_text = build_status_text(pane_text)
 
-    if status_line:
-        custom = parse_custom_statusline(pane_text) if config.show_statusline else None
-        if custom:
-            # Code spans keep bars aligned and a user's script from being read as markdown
-            rows = (f"`{row.replace('`', chr(39))}`" for row in custom.split("\n"))
-            status_line = "\n".join((status_line, *rows))
+    # With nothing to show, keep a working status (don't clear on transient state),
+    # but a statusLine left over from a Claude Code that has exited must go
+    if status_text or is_showing_only_statusline(user_id, thread_id):
         await enqueue_status_update(
             bot,
             user_id,
             window_id,
-            status_line,
+            status_text,
             thread_id=thread_id,
         )
-    # If no status line, keep existing status message (don't clear on transient state)
 
 
 async def _private_topic_deleted(bot: Bot, chat_id: int, thread_id: int) -> bool:
