@@ -23,8 +23,13 @@ import time
 from telegram import Bot
 from telegram.error import BadRequest
 
+from ..config import config
 from ..session import session_manager
-from ..terminal_parser import is_interactive_ui, parse_status_line
+from ..terminal_parser import (
+    is_interactive_ui,
+    parse_custom_statusline,
+    parse_status_line,
+)
 from ..tmux_manager import tmux_manager
 from .interactive_ui import (
     clear_interactive_msg,
@@ -109,6 +114,11 @@ async def update_status_message(
     status_line = parse_status_line(pane_text)
 
     if status_line:
+        custom = parse_custom_statusline(pane_text) if config.show_statusline else None
+        if custom:
+            # Code spans keep bars aligned and a user's script from being read as markdown
+            rows = (f"`{row.replace('`', chr(39))}`" for row in custom.split("\n"))
+            status_line = "\n".join((status_line, *rows))
         await enqueue_status_update(
             bot,
             user_id,

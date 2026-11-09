@@ -96,6 +96,12 @@ class Config:
             os.getenv("CCBOT_SHOW_TOOL_CALLS", "true").lower() != "false"
         )
 
+        # Add the user's own Claude Code statusLine to the working status message.
+        # Only has an effect in panes where a statusLine is actually drawn.
+        self.show_statusline = (
+            os.getenv("CCBOT_SHOW_STATUSLINE", "true").lower() != "false"
+        )
+
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"

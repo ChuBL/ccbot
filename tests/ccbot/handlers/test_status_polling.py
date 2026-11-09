@@ -139,3 +139,45 @@ class TestStatusPollerSettingsDetection:
             assert keyboard is not None
             # Verify the message text contains model picker content
             assert "Select model" in call_kwargs["text"]
+
+
+class TestStatuslineInStatusMessage:
+    RULE = "─" * 40
+    PANE = "\n".join(
+        ["· Working… (3s)", RULE, "❯ ", RULE, "  ctx:██ `16%", "  ⏵⏵ auto mode on"]
+    )
+
+    async def _status_sent(self, pane: str, enabled: bool = True) -> str:
+        window = MagicMock(window_id="@1", pane_current_command="claude")
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as tm,
+            patch("ccbot.handlers.status_polling.config") as cfg,
+            patch(
+                "ccbot.handlers.status_polling.enqueue_status_update",
+                new=AsyncMock(),
+            ) as enqueue,
+            patch(
+                "ccbot.handlers.status_polling.get_interactive_window",
+                return_value=None,
+            ),
+            patch(
+                "ccbot.handlers.status_polling.is_interactive_ui", return_value=False
+            ),
+        ):
+            cfg.show_statusline = enabled
+            tm.find_window_by_id = AsyncMock(return_value=window)
+            tm.capture_pane = AsyncMock(return_value=pane)
+            await update_status_message(AsyncMock(), 1, "@1", thread_id=7)
+        return enqueue.await_args.args[3]
+
+    async def test_added_below_the_spinner_as_code(self) -> None:
+        assert await self._status_sent(self.PANE) == "Working… (3s)\n`ctx:██ '16%`"
+
+    async def test_switch_turns_it_off(self) -> None:
+        assert await self._status_sent(self.PANE, enabled=False) == "Working… (3s)"
+
+    async def test_no_statusline_leaves_the_status_alone(self) -> None:
+        pane = "\n".join(
+            ["· Working… (3s)", self.RULE, "❯ ", self.RULE, "  ⏵⏵ auto mode on"]
+        )
+        assert await self._status_sent(pane) == "Working… (3s)"
