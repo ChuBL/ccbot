@@ -268,6 +268,9 @@ def is_interactive_ui(pane_text: str) -> bool:
 STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢"])
 
 
+_HINT_LINE_STARTS = "⏵⏸?"
+
+
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.
 
@@ -305,6 +308,28 @@ def parse_status_line(pane_text: str) -> str | None:
         # First non-empty line above separator isn't a spinner → no status
         return None
     return None
+
+
+def parse_custom_statusline(pane_text: str) -> str | None:
+    """Extract the user's own statusLine from below the input box.
+
+    Below the box's lower separator Claude Code draws the statusLine, if one is
+    configured, and then one hint line ("⏵⏵ auto mode on ...", "? for shortcuts").
+    With no statusLine the hint is alone there, so one line means nothing to show.
+
+    Returns the statusLine (one line per row), or None if there is none.
+    """
+    lines = pane_text.rstrip().split("\n")[-10:]
+    separators = [
+        i
+        for i, line in enumerate(lines)
+        if len(line.strip()) >= 20 and all(c == "─" for c in line.strip())
+    ]
+    if len(separators) < 2:  # Both edges of the input box must be on screen
+        return None
+    below = [line.strip() for line in lines[separators[-1] + 1 :] if line.strip()]
+    custom = [line for line in below[:-1] if line[0] not in _HINT_LINE_STARTS]
+    return "\n".join(custom) or None
 
 
 # ── Pane chrome stripping & bash output extraction ─────────────────────

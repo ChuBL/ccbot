@@ -6,6 +6,7 @@ from ccbot.terminal_parser import (
     extract_bash_output,
     extract_interactive_content,
     is_interactive_ui,
+    parse_custom_statusline,
     parse_status_line,
     strip_pane_chrome,
 )
@@ -292,3 +293,45 @@ class TestTrustDialog:
 
     def test_last_frame_above_a_shell_prompt_is_not_a_dialog(self) -> None:
         assert extract_interactive_content(self.DIALOG + "user@host ➜ app\n") is None
+
+
+# ── parse_custom_statusline ─────────────────────────────────────────────
+
+
+class TestParseCustomStatusline:
+    """Layouts captured from real Claude Code panes."""
+
+    RULE = "─" * 40
+    BAR = "Opus 5.5 ctx:██░░░░░░░░ 16% -4.2h:█░░░░░░░░░ 5%"
+
+    def _pane(self, *below: str) -> str:
+        return "\n".join(["· Orbiting… (17s)", self.RULE, "❯ ", self.RULE, *below])
+
+    def test_statusline_above_the_hint(self) -> None:
+        pane = self._pane(f"  {self.BAR}", "  ⏵⏵ auto mode on (shift+tab to cycle)")
+        assert parse_custom_statusline(pane) == self.BAR
+
+    def test_every_row_of_a_multi_line_statusline(self) -> None:
+        pane = self._pane("  one", "  two", "  ⏸ manual mode on · ? for shortcuts")
+        assert parse_custom_statusline(pane) == "one\ntwo"
+
+    @pytest.mark.parametrize(
+        "hint",
+        [
+            "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+            "⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents",
+            "⏸ manual mode on · ? for shortcuts · ← for agents",
+            "⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
+            "⏸ plan mode on (shift+tab to cycle) · ← for agents",
+        ],
+    )
+    def test_hint_alone_means_no_statusline(self, hint: str) -> None:
+        assert parse_custom_statusline(self._pane(f"  {hint}")) is None
+
+    def test_trailing_blank_rows_are_ignored(self) -> None:
+        pane = self._pane(f"  {self.BAR}", "  ⏵⏵ auto mode on") + "\n\n\n"
+        assert parse_custom_statusline(pane) == self.BAR
+
+    def test_no_input_box_on_screen(self) -> None:
+        assert parse_custom_statusline("plain output\n$ ") is None
+        assert parse_custom_statusline(f"{self.RULE}\nx\ny") is None
