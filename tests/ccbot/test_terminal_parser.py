@@ -303,6 +303,10 @@ class TestParseCustomStatusline:
         pane = self._pane(f"  {self.BAR}", "  ⏵⏵ auto mode on") + "\n\n\n"
         assert parse_custom_statusline(pane) == self.BAR
 
+    def test_shell_prompt_below_an_old_frame(self) -> None:
+        pane = self._pane(f"  {self.BAR}", "  ⏵⏵ auto mode on", "Resume with x", "$ ")
+        assert parse_custom_statusline(pane) is None
+
     def test_no_input_box_on_screen(self) -> None:
         assert parse_custom_statusline("plain output\n$ ") is None
         assert parse_custom_statusline(f"{self.RULE}\nx\ny") is None

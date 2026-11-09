@@ -27,9 +27,10 @@ from telegram import Bot
 from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 
+from ..config import config
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
-from ..terminal_parser import parse_status_line
+from ..terminal_parser import parse_custom_statusline, parse_status_line
 from ..tmux_manager import tmux_manager
 from .message_sender import (
     NO_LINK_PREVIEW,
@@ -40,6 +41,21 @@ from .message_sender import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def build_status_text(pane_text: str) -> str | None:
+    """The status message for a pane: the working line, the statusLine, or both."""
+    rows = [parse_status_line(pane_text)]
+    custom = parse_custom_statusline(pane_text) if config.show_statusline else None
+    if custom:
+        # Code spans keep bars aligned and a user's script from being read as markdown
+        rows += [f"`{row.replace('`', chr(39))}`" for row in custom.split("\n")]
+    return "\n".join(row for row in rows if row) or None
+
+
+def _is_statusline_only(status_text: str) -> bool:
+    """Whether a status message has no working line, so Claude Code is idle."""
+    return status_text.startswith("`")
 
 
 def _ensure_formatted(text: str) -> str:
@@ -585,6 +601,7 @@ async def _do_send_status_message(
         bot,
         chat_id,
         text,
+        disable_notification=_is_statusline_only(text),
         **_send_kwargs(thread_id),  # type: ignore[arg-type]
     )
     if sent:
@@ -628,9 +645,9 @@ async def _check_and_send_status(
         return
 
     tid = thread_id or 0
-    status_line = parse_status_line(pane_text)
-    if status_line:
-        await _do_send_status_message(bot, user_id, tid, window_id, status_line)
+    status_text = build_status_text(pane_text)
+    if status_text:
+        await _do_send_status_message(bot, user_id, tid, window_id, status_text)
 
 
 async def enqueue_content_message(
@@ -701,6 +718,18 @@ async def enqueue_status_update(
         task = MessageTask(task_type="status_clear", thread_id=thread_id)
 
     queue.put_nowait(task)
+
+
+def is_showing_only_statusline(user_id: int, thread_id: int | None) -> bool:
+    """Whether this topic's status message is a statusLine with no working line."""
+    info = _status_msg_info.get((user_id, thread_id or 0))
+    return info is not None and _is_statusline_only(info[2])
+
+
+async def delete_status_messages(bot: Bot) -> None:
+    """Remove status messages, which nothing could update after a restart."""
+    for user_id, tid in list(_status_msg_info):
+        await _do_clear_status_message(bot, user_id, tid)
 
 
 def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:

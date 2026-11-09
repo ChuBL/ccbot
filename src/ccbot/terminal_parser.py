@@ -259,6 +259,8 @@ def parse_custom_statusline(pane_text: str) -> str | None:
     if len(separators) < 2:  # Both edges of the input box must be on screen
         return None
     below = [line.strip() for line in lines[separators[-1] + 1 :] if line.strip()]
+    if not below or below[-1][0] not in _HINT_LINE_STARTS:
+        return None  # Not the live input box, e.g. a shell prompt under an old frame
     custom = [line for line in below[:-1] if line[0] not in _HINT_LINE_STARTS]
     return "\n".join(custom) or None
 
