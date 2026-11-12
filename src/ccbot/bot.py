@@ -5,7 +5,7 @@ Each Telegram topic maps 1:1 to a tmux window (Claude session).
 
 Core responsibilities:
   - Command handlers: /start, /history, /screenshot, /esc, /kill, /unbind,
-    plus forwarding unknown /commands to Claude Code via tmux.
+    /send, plus forwarding unknown /commands to Claude Code via tmux.
   - Callback query handler: directory browser, history pagination,
     interactive UI navigation, screenshot refresh.
   - Topic-based routing: each named topic binds to one tmux window.
@@ -24,6 +24,7 @@ Handler modules (in handlers/):
   - message_queue: Per-user message queue management
   - message_sender: Safe message sending helpers
   - history: Message history pagination
+  - file_sender: /send and the `ccbot send` outbox
   - directory_browser: Directory browser UI
   - interactive_ui: Interactive UI handling
   - status_polling: Terminal status polling
@@ -110,6 +111,7 @@ from .handlers.directory_browser import (
     clear_session_picker_state,
     clear_window_picker_state,
 )
+from .handlers.file_sender import outbox_poll_loop, send_file_command
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
@@ -163,6 +165,9 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+
+# Outbox polling task (files queued by `ccbot send`)
+_outbox_poll_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -270,6 +275,29 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     await send_history(update.message, wid)
+
+
+async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a file from the machine to this topic."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        return
+
+    await send_file_command(update.message, w.cwd)
 
 
 async def screenshot_command(
@@ -1975,7 +2003,7 @@ async def handle_session_started(
 
 
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task
+    global session_monitor, _status_poll_task, _outbox_poll_task
 
     await application.bot.delete_my_commands()
 
@@ -1983,6 +2011,7 @@ async def post_init(application: Application) -> None:
         BotCommand("start", "Show welcome message"),
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
+        BotCommand("send", "Send a file from the machine: /send <path>"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
         BotCommand("kill", "Kill this topic's tmux window (asks first)"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
@@ -2028,10 +2057,22 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # Start outbox polling task
+    _outbox_poll_task = asyncio.create_task(outbox_poll_loop(application.bot))
+
 
 async def post_stop(application: Application) -> None:
     """Stop what updates status messages, while the bot can still delete them."""
-    global _status_poll_task
+    global _status_poll_task, _outbox_poll_task
+
+    # Stop outbox polling
+    if _outbox_poll_task:
+        _outbox_poll_task.cancel()
+        try:
+            await _outbox_poll_task
+        except asyncio.CancelledError:
+            pass
+        _outbox_poll_task = None
 
     # Stop status polling
     if _status_poll_task:
@@ -2071,6 +2112,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
+    application.add_handler(CommandHandler("send", send_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("kill", kill_command))

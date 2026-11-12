@@ -28,6 +28,7 @@ In fact, CCBot itself was built this way — iterating on itself through Claude 
 - **Interactive UI** — Navigate AskUserQuestion, ExitPlanMode, and Permission Prompts via inline keyboard
 - **Voice messages** — Voice messages are transcribed via OpenAI and forwarded as text
 - **Send messages** — Forward text to Claude Code via tmux keystrokes
+- **Send files** — Get any file from the machine as a Telegram document, with `/send <path>` or by letting Claude Code run `ccbot send <file>`
 - **Slash command forwarding** — Send any `/command` directly to Claude Code (e.g. `/clear`, `/compact`, `/cost`)
 - **Create new sessions** — Start Claude Code sessions from Telegram via directory browser
 - **Resume sessions** — Pick up where you left off by resuming an existing Claude session in a directory
@@ -151,6 +152,7 @@ uv run ccbot
 | `/start`      | Show welcome message            |
 | `/history`    | Message history for this topic  |
 | `/screenshot` | Capture terminal screenshot     |
+| `/send <path>` | Send a file from the machine to this topic |
 | `/esc`        | Send Escape to interrupt Claude |
 
 **Claude Code commands (forwarded via tmux):**
@@ -180,6 +182,16 @@ Any unrecognized `/command` is also forwarded to Claude Code as-is (e.g. `/revie
 **Sending messages:**
 
 Once a topic is bound to a session, just send text or voice messages in that topic — text gets forwarded to Claude Code via tmux keystrokes, and voice messages are automatically transcribed and forwarded as text.
+
+**Getting files:**
+
+`/send <path>` sends a file from the machine to the topic as a document (uncompressed, up to Telegram's 50 MB limit). A relative path starts at the session's working directory.
+
+Claude Code can send files on its own by running `ccbot send <file>...` (optionally `--caption "text"`) in its window; the file arrives in the topic bound to that window. To make it do so when you ask for a file, add a line to your `CLAUDE.md`, for example:
+
+```
+To give the user a file, run `ccbot send <path>`; it is delivered to their Telegram.
+```
 
 **Killing a session:**
 
@@ -253,6 +265,7 @@ src/ccbot/
 ├── __init__.py            # Package entry point
 ├── main.py                # CLI dispatcher (hook subcommand + bot bootstrap)
 ├── hook.py                # Hook subcommand for session tracking (+ --install)
+├── outbox.py              # `ccbot send` subcommand + file request queue read by the bot
 ├── config.py              # Configuration from environment variables
 ├── bot.py                 # Telegram bot setup, command handlers, topic routing
 ├── session.py             # Session management, state persistence, message history
@@ -270,6 +283,7 @@ src/ccbot/
     ├── __init__.py        # Handler module exports
     ├── callback_data.py   # Callback data constants (CB_* prefixes)
     ├── directory_browser.py # Directory browser inline keyboard UI
+    ├── file_sender.py     # /send and delivery of `ccbot send` files
     ├── history.py         # Message history pagination
     ├── interactive_ui.py  # Interactive UI handling (AskUser, ExitPlan, Permissions)
     ├── message_queue.py   # Per-user message queue + worker (merge, rate limit)

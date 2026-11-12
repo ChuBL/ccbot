@@ -1,8 +1,9 @@
 """Application entry point — CLI dispatcher and bot bootstrap.
 
-Handles two execution modes:
+Handles three execution modes:
   1. `ccbot hook` — delegates to hook.hook_main() for Claude Code hook processing.
-  2. Default — configures logging, initializes tmux session, and starts the
+  2. `ccbot send` — delegates to outbox.send_main() to send files to Telegram.
+  3. Default — configures logging, initializes tmux session, and starts the
      Telegram bot polling loop via bot.create_bot().
 """
 
@@ -18,10 +19,19 @@ def main() -> None:
 
             hook_main()
             return
+        if sys.argv[1] == "send":
+            from .outbox import send_main
+
+            send_main()
+            return
         # Reject anything else: silently falling through to "start the bot"
         # means a typo (or `ccbot --help`) launches a second bot instance
         # that races the real one for Telegram updates.
-        usage = "Usage: ccbot        start the Telegram bot\n       ccbot hook   run as Claude Code SessionStart hook"
+        usage = (
+            "Usage: ccbot              start the Telegram bot\n"
+            "       ccbot hook         run as Claude Code SessionStart hook\n"
+            "       ccbot send <file>  send a file to this tmux window's topic"
+        )
         if sys.argv[1] in ("-h", "--help"):
             print(usage)
             return
