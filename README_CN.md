@@ -25,6 +25,7 @@ CCBot 让你**通过 Telegram 无缝接管同一个会话**。核心设计思路
 - **交互式 UI** — 通过内联键盘操作 AskUserQuestion、ExitPlanMode 和权限提示
 - **语音消息** — 语音消息通过 OpenAI 转录为文字并转发
 - **发送消息** — 通过 tmux 按键将文字转发给 Claude Code
+- **发送文件** — 用 `/send <路径>`，或让 Claude Code 运行 `ccbot send <文件>`，把机器上的任意文件以 Telegram 文档形式发给你
 - **斜杠命令转发** — 任何 `/command` 直接发送给 Claude Code（如 `/clear`、`/compact`、`/cost`）
 - **创建新会话** — 通过目录浏览器从 Telegram 启动 Claude Code 会话
 - **恢复会话** — 选择目录中已有的 Claude 会话继续上次的工作
@@ -146,6 +147,7 @@ uv run ccbot
 | `/start` | 显示欢迎消息 |
 | `/history` | 当前话题的消息历史 |
 | `/screenshot` | 截取终端屏幕 |
+| `/send <路径>` | 把机器上的文件发送到当前话题 |
 | `/esc` | 发送 Escape 键中断 Claude |
 
 **Claude Code 命令（通过 tmux 转发）：**
@@ -175,6 +177,16 @@ uv run ccbot
 **发送消息：**
 
 话题绑定会话后，直接在话题中发送文字或语音消息即可 — 文字会通过 tmux 按键转发给 Claude Code，语音消息会自动转录为文字后转发。
+
+**获取文件：**
+
+`/send <路径>` 把机器上的文件以文档形式（不压缩，上限为 Telegram 的 50 MB）发送到话题。相对路径从会话的工作目录算起。
+
+Claude Code 也可以在自己的窗口里运行 `ccbot send <文件>...`（可加 `--caption "说明"`）主动发送文件，文件会出现在该窗口绑定的话题中。想让它在你要文件时这样做，可以在 `CLAUDE.md` 里加一行，例如：
+
+```
+需要把文件交给用户时，运行 `ccbot send <路径>`，文件会发送到用户的 Telegram。
+```
 
 **关闭会话：**
 
@@ -266,6 +278,7 @@ src/ccbot/
 ├── __init__.py            # 包入口
 ├── main.py                # CLI 调度器（hook 子命令 + bot 启动）
 ├── hook.py                # Hook 子命令，用于会话追踪（+ --install）
+├── outbox.py              # `ccbot send` 子命令 + 供 bot 读取的文件请求队列
 ├── config.py              # 环境变量配置
 ├── bot.py                 # Telegram Bot 设置、命令处理、话题路由
 ├── session.py             # 会话管理、状态持久化、消息历史
@@ -283,6 +296,7 @@ src/ccbot/
     ├── __init__.py        # Handler 模块导出
     ├── callback_data.py   # 回调数据常量（CB_* 前缀）
     ├── directory_browser.py # 目录浏览器内联键盘 UI
+    ├── file_sender.py     # /send 以及 `ccbot send` 文件的投递
     ├── history.py         # 消息历史分页
     ├── interactive_ui.py  # 交互式 UI 处理（AskUser、ExitPlan、权限）
     ├── message_queue.py   # 每用户消息队列 + worker（合并、限流）

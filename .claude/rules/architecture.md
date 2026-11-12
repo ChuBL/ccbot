@@ -7,6 +7,7 @@
 │  - /history: Paginated message history (default: latest page)      │
 │  - /screenshot: Capture tmux pane as PNG                           │
 │  - /esc: Send Escape to interrupt Claude                           │
+│  - /send: Send a file from the machine as a document               │
 │  - Send text → Claude Code via tmux keystrokes                     │
 │  - Forward /commands to Claude Code                                │
 │  - Create sessions via directory browser in unbound topics         │
@@ -71,6 +72,7 @@ Additional modules:
   screenshot.py       ─ Terminal text → PNG rendering (ANSI color, font fallback)
   transcribe.py       ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
   main.py             ─ CLI entry point
+  outbox.py           ─ `ccbot send` CLI + outbox request/result files (no config import)
   utils.py            ─ Shared utilities (ccbot_dir, atomic_write_json)
 
 Handler modules (handlers/):
@@ -81,12 +83,14 @@ Handler modules (handlers/):
   interactive_ui.py   ─ AskUserQuestion / ExitPlanMode / Permission UI
   directory_browser.py─ Directory selection + session picker UI for new topics
   cleanup.py          ─ Topic state cleanup on close/delete
+  file_sender.py      ─ /send + outbox polling (1s): deliver `ccbot send` files to bound topics
   callback_data.py    ─ Callback data constants
 
 State files (~/.ccbot/ or $CCBOT_DIR/):
   state.json         ─ thread bindings + window states + display names + read offsets
   session_map.json   ─ hook-generated window_id→session mapping
   monitor_state.json ─ poll progress (byte offset) per JSONL file
+  outbox/            ─ pending `ccbot send` requests (*.json) and their results (*.result)
 ```
 
 ## Key Design Decisions
