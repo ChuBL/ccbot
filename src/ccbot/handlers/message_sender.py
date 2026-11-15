@@ -7,6 +7,7 @@ Uses telegramify-markdown for MarkdownV2 formatting.
 
 Functions:
   - send_with_fallback: Send with formatting → plain text fallback
+  - is_delivery_unknown: Whether a failed request may still have gone through
   - send_photo: Photo sending (single or media group)
   - safe_reply: Reply with formatting, fallback to plain text
   - safe_edit: Edit message with formatting, fallback to plain text
@@ -21,7 +22,7 @@ import logging
 from typing import Any
 
 from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, Message
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter
 
 from ..markdown_v2 import convert_markdown
 from ..transcript_parser import TranscriptParser
@@ -51,16 +52,26 @@ PARSE_MODE = "MarkdownV2"
 NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
+def is_delivery_unknown(error: Exception) -> bool:
+    """True for a timeout or network failure: Telegram may still have done the request."""
+    return isinstance(error, NetworkError) and not isinstance(error, BadRequest)
+
+
 async def send_with_fallback(
     bot: Bot,
     chat_id: int,
     text: str,
+    *,
+    resend_when_delivery_unknown: bool = True,
     **kwargs: Any,
 ) -> Message | None:
     """Send message with MarkdownV2, falling back to plain text on failure.
 
     Returns the sent Message on success, None on failure.
     RetryAfter is re-raised for caller handling.
+
+    With resend_when_delivery_unknown=False a timeout or network failure is not
+    followed by the plain text attempt, which could deliver the message twice.
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     try:
@@ -72,7 +83,10 @@ async def send_with_fallback(
         )
     except RetryAfter:
         raise
-    except Exception:
+    except Exception as e:
+        if not resend_when_delivery_unknown and is_delivery_unknown(e):
+            logger.error(f"Failed to send message to {chat_id}: {e}")
+            return None
         try:
             return await bot.send_message(
                 chat_id=chat_id, text=strip_sentinels(text), **kwargs

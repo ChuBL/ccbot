@@ -35,6 +35,7 @@ from ..tmux_manager import tmux_manager
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
+    is_delivery_unknown,
     send_photo,
     send_with_fallback,
     strip_sentinels,
@@ -93,6 +94,12 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
+
+# After a status message failed to send, when the next one may be sent
+# (time.monotonic()). A send that timed out may have been delivered without us
+# learning its id, so trying again on every poll can fill the topic with copies.
+STATUS_SEND_RETRY_SECONDS = 60.0
+_status_send_retry_at: dict[tuple[int, int], float] = {}
 
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
@@ -550,7 +557,12 @@ async def _process_status_update_task(
                 _status_msg_info[skey] = (msg_id, wid, status_text)
             except RetryAfter:
                 raise
-            except Exception:
+            except Exception as e:
+                if is_delivery_unknown(e):
+                    # The message is still there: keep it and edit again on the
+                    # next poll, instead of sending a new one each time.
+                    logger.debug(f"Status message edit deferred: {e}")
+                    return
                 try:
                     await bot.edit_message_text(
                         chat_id=chat_id,
@@ -562,6 +574,9 @@ async def _process_status_update_task(
                 except RetryAfter:
                     raise
                 except Exception as e:
+                    if is_delivery_unknown(e):
+                        logger.debug(f"Status message edit deferred: {e}")
+                        return
                     logger.debug(f"Failed to edit status message: {e}")
                     _status_msg_info.pop(skey, None)
                     await _do_send_status_message(bot, user_id, tid, wid, status_text)
@@ -589,6 +604,8 @@ async def _do_send_status_message(
             await bot.delete_message(chat_id=chat_id, message_id=old[0])
         except Exception:
             pass
+    if time.monotonic() < _status_send_retry_at.get(skey, 0.0):
+        return
     # Send typing indicator when Claude is working
     if "esc to interrupt" in text.lower():
         try:
@@ -601,11 +618,15 @@ async def _do_send_status_message(
         bot,
         chat_id,
         text,
+        resend_when_delivery_unknown=False,
         disable_notification=_is_statusline_only(text),
         **_send_kwargs(thread_id),  # type: ignore[arg-type]
     )
     if sent:
         _status_msg_info[skey] = (sent.message_id, window_id, text)
+        _status_send_retry_at.pop(skey, None)
+    else:
+        _status_send_retry_at[skey] = time.monotonic() + STATUS_SEND_RETRY_SECONDS
 
 
 async def _do_clear_status_message(
