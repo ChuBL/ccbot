@@ -17,8 +17,11 @@ from ccbot.handlers.callback_data import (
 from ccbot.handlers.interactive_ui import (
     _awaiting_ready,
     _build_interactive_keyboard,
+    _esc_armed,
     announce_ready,
+    answer_question_with_text,
     answer_trust_dialog,
+    confirm_esc,
     expect_ready,
     handle_interactive_ui,
 )
@@ -159,6 +162,168 @@ class TestAnswerTrustDialog:
             ok, _ = await answer_trust_dialog("@1", True)
         assert not ok
         assert self._keys(tmux) == []
+
+
+SEP = "─" * 80
+
+
+def question(cursor: int, typed: str = "", answered: bool = False) -> str:
+    """A three-tab AskUserQuestion screen, as Claude Code 2.1.325 draws it."""
+    labels = ["Round", "Square", typed or "Type something."]
+    if answered:
+        labels[2] += " ✔"
+    rows = []
+    for i, label in enumerate(labels):
+        rows.append(f"{'❯' if cursor == i else ' '} {i + 1}. {label}")
+        if i < 2:
+            rows.append(f"     {label}")
+    chat = f"{'❯' if cursor == 3 else ' '} 4. Chat about this"
+    return "\n".join(
+        [
+            "←  ☒ Color  ☒ Size  ☐ Shape  ✔ Submit  →",
+            "",
+            "Which shape?",
+            "",
+            *rows,
+            SEP,
+            chat,
+            "",
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+        ]
+    )
+
+
+REVIEW = "\n".join(
+    [
+        "←  ☒ Color  ☒ Size  ☒ Shape  ✔ Submit  →",
+        "",
+        "Review your answers",
+        " ● Which color?",
+        "   → Red",
+        "Ready to submit your answers?",
+        "❯ 1. Submit answers",
+        "  2. Cancel",
+    ]
+)
+
+
+class TestAnswerQuestionWithText:
+    """Text sent while a question shows goes into its "Type something" row.
+
+    The case behind it: with two questions answered by buttons, the third was
+    meant to be typed. Esc looked like the way out of the options and threw
+    all three away.
+    """
+
+    def _tmux(self, *frames: str) -> MagicMock:
+        tmux = MagicMock()
+        tmux.capture_pane = AsyncMock(side_effect=list(frames))
+        tmux.send_keys = AsyncMock(return_value=True)
+        return tmux
+
+    def _keys(self, tmux: MagicMock) -> list[str]:
+        return [call.args[1] for call in tmux.send_keys.call_args_list]
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self):
+        with patch("ccbot.handlers.interactive_ui.asyncio.sleep", AsyncMock()):
+            yield
+
+    async def test_moves_to_the_text_row_before_typing(self) -> None:
+        tmux = self._tmux(
+            question(0), question(1), question(2), question(2, typed="a 2 b c")
+        )
+        with patch("ccbot.handlers.interactive_ui.tmux_manager", tmux):
+            ok, note = await answer_question_with_text("@1", "a 2 b\nc")
+        assert ok and note == ""
+        # the line break is a space: as a key it would be Enter
+        assert self._keys(tmux) == ["Down", "Down", "a 2 b c", "Enter"]
+
+    async def test_comes_up_from_chat_about_this(self) -> None:
+        tmux = self._tmux(question(3), question(2), question(2, typed="mine"))
+        with patch("ccbot.handlers.interactive_ui.tmux_manager", tmux):
+            ok, _ = await answer_question_with_text("@1", "mine")
+        assert ok
+        assert self._keys(tmux) == ["Up", "mine", "Enter"]
+
+    async def test_an_earlier_typed_answer_is_cleared_first(self) -> None:
+        tmux = self._tmux(
+            question(2, typed="old", answered=True),
+            question(2, answered=True),
+            question(2, typed="new", answered=True),
+        )
+        with patch("ccbot.handlers.interactive_ui.tmux_manager", tmux):
+            ok, _ = await answer_question_with_text("@1", "new")
+        assert ok
+        assert self._keys(tmux) == ["C-u", "new", "Enter"]
+
+    async def test_no_enter_when_the_text_is_not_seen_on_the_row(self) -> None:
+        tmux = self._tmux(question(2), question(2))
+        with patch("ccbot.handlers.interactive_ui.tmux_manager", tmux):
+            ok, note = await answer_question_with_text("@1", "mine")
+        assert not ok and "Check the question" in note
+        assert self._keys(tmux) == ["mine"]
+
+    async def test_nothing_is_typed_on_the_review_page(self) -> None:
+        tmux = self._tmux(REVIEW)
+        with patch("ccbot.handlers.interactive_ui.tmux_manager", tmux):
+            ok, note = await answer_question_with_text("@1", "mine")
+        assert not ok and "review page" in note
+        assert self._keys(tmux) == []
+
+    async def test_nothing_is_typed_into_a_layout_it_cannot_read(self) -> None:
+        # no "Chat about this" row: not the layout this was written against
+        unknown = question(0).replace("4. Chat about this", "")
+        tmux = self._tmux(unknown)
+        with patch("ccbot.handlers.interactive_ui.tmux_manager", tmux):
+            ok, note = await answer_question_with_text("@1", "mine")
+        assert not ok and "could not read" in note
+        assert self._keys(tmux) == []
+
+    async def test_multi_select_is_left_for_the_user_to_confirm(self) -> None:
+        def multi(typed: str = "") -> str:
+            return "\n".join(
+                [
+                    "←  ☐ Toppings  ☐ Drink  ✔ Submit  →",
+                    "Which toppings?",
+                    "  1. [✔] Cheese",
+                    "         Cheese",
+                    "  2. [ ] Ham",
+                    "         Ham",
+                    f"❯ 3. [{'✔' if typed else ' '}] {typed or 'Type something'}",
+                    "     Next",
+                    SEP,
+                    "  4. Chat about this",
+                ]
+            )
+
+        tmux = self._tmux(multi(), multi("olives"))
+        with patch("ccbot.handlers.interactive_ui.tmux_manager", tmux):
+            ok, note = await answer_question_with_text("@1", "olives")
+        assert ok and "Next" in note
+        # typing ticks the row; Enter would untick it
+        assert self._keys(tmux) == ["olives"]
+
+
+class TestConfirmEsc:
+    def test_takes_two_presses(self) -> None:
+        _esc_armed.clear()
+        assert not confirm_esc(1, "@1")
+        assert confirm_esc(1, "@1")
+        # and the pair is used up
+        assert not confirm_esc(1, "@1")
+
+    def test_a_late_second_press_only_arms_it_again(self) -> None:
+        _esc_armed.clear()
+        with patch("ccbot.handlers.interactive_ui.time.monotonic", return_value=100.0):
+            assert not confirm_esc(1, "@1")
+        with patch("ccbot.handlers.interactive_ui.time.monotonic", return_value=200.0):
+            assert not confirm_esc(1, "@1")
+
+    def test_another_window_is_not_armed(self) -> None:
+        _esc_armed.clear()
+        assert not confirm_esc(1, "@1")
+        assert not confirm_esc(1, "@2")
 
 
 class TestAnnounceReady:

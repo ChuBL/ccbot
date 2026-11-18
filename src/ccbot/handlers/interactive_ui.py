@@ -29,6 +29,7 @@ from ..terminal_parser import (
     _shorten_separators,
     extract_interactive_content,
     is_interactive_ui,
+    parse_question_screen,
 )
 from ..tmux_manager import tmux_manager
 from .callback_data import (
@@ -208,6 +209,127 @@ async def answer_trust_dialog(window_id: str, trust: bool) -> tuple[bool, str]:
                 "send claude to start it again, or /kill to close the window."
             )
     return False, "Claude Code did not respond to that."
+
+
+# Local patch: a message sent while a question is on screen is typed as the answer
+ASK_USER_QUESTION = "AskUserQuestion"
+ASK_HINT = (
+    "✏️ To answer in your own words, send them as a message."
+    "\n⎋ Esc cancels every question, the answered ones too."
+)
+_ASK_MOVE_TRIES = 15
+_ESC_CONFIRM_SECONDS = 15.0
+
+# (user_id, window_id) -> time until which a second Esc press goes through
+_esc_armed: dict[tuple[int, str], float] = {}
+
+
+async def question_on_screen(window_id: str) -> bool:
+    """Whether the window is showing an AskUserQuestion screen right now."""
+    pane_text = await tmux_manager.capture_pane(window_id)
+    content = extract_interactive_content(pane_text) if pane_text else None
+    return bool(content and content.name == ASK_USER_QUESTION)
+
+
+def confirm_esc(user_id: int, window_id: str) -> bool:
+    """First Esc press on a question arms it and returns False; the next one passes.
+
+    Esc throws away the whole question, with every answer already picked, and
+    it is the button people reach for when they want to type instead.
+    """
+    now = time.monotonic()
+    if _esc_armed.pop((user_id, window_id), 0.0) >= now:
+        return True
+    _esc_armed[(user_id, window_id)] = now + _ESC_CONFIRM_SECONDS
+    return False
+
+
+async def answer_question_with_text(window_id: str, text: str) -> tuple[bool, str]:
+    """Type ``text`` as the answer to the question on screen.
+
+    The text goes into the question's own "Type something" row, which first
+    needs the cursor on it: typed anywhere else, letters are dropped, a digit
+    picks that option and Enter picks whatever is highlighted.  Nothing is
+    typed unless the cursor has been seen on that row.
+    """
+    answer = " ".join(text.split())  # a line break would act as Enter
+    if not answer:
+        return False, "Not sent: the message is empty."
+
+    async def read():
+        pane_text = await tmux_manager.capture_pane(window_id)
+        content = extract_interactive_content(pane_text) if pane_text else None
+        if not content or content.name != ASK_USER_QUESTION:
+            return None
+        return parse_question_screen(content.content)
+
+    async def key(name: str) -> None:
+        await tmux_manager.send_keys(window_id, name, enter=False, literal=False)
+        await asyncio.sleep(0.3)
+
+    screen = await read()
+    if screen is None:
+        logger.warning(
+            "Question screen in %s not understood, text not typed", window_id
+        )
+        return False, (
+            "Not sent: I could not read this question's layout, and typing blindly "
+            "could pick an option. Use the buttons, or press Esc twice and reply normally."
+        )
+    if screen.review:
+        return False, (
+            "Not sent: this is the review page. Press ⏎ Enter to submit, or ← to "
+            "go back to a question and send your answer there."
+        )
+    for _ in range(_ASK_MOVE_TRIES):
+        if screen.cursor_line == screen.free_line:
+            break
+        assert screen.cursor_line is not None and screen.free_line is not None
+        await key("Down" if screen.free_line > screen.cursor_line else "Up")
+        screen = await read()
+        if screen is None or screen.review:
+            return False, "Not sent: the question changed while moving to its text row."
+    else:
+        return False, "Not sent: could not reach the question's text row."
+
+    if not screen.free_is_empty:
+        await key("C-u")  # an earlier answer typed here is replaced, not added to
+        screen = await read()
+        if (
+            screen is None
+            or screen.cursor_line != screen.free_line
+            or not screen.free_is_empty
+        ):
+            return False, "Not sent: could not clear the answer typed there before."
+
+    await tmux_manager.send_keys(window_id, answer, enter=False, literal=True)
+    await asyncio.sleep(0.5)
+    screen = await read()
+    probe = answer[:8]
+    if (
+        screen is None
+        or screen.cursor_line != screen.free_line
+        or not screen.free_label.startswith(probe)
+    ):
+        logger.warning("Typed answer not seen on the text row of %s", window_id)
+        return False, (
+            "The text may not have gone into the answer row. Check the question "
+            "above before pressing Enter."
+        )
+    logger.info(
+        "Answer typed into the question in %s (%d chars, %s)",
+        window_id,
+        len(answer),
+        "multi-select, left for the user to confirm" if screen.multi else "entered",
+    )
+    if screen.multi:
+        # Typing ticks the row; Enter here would untick it
+        return (
+            True,
+            "✏️ Added as an answer. Pick more, or go ↓ to Next and press ⏎ Enter.",
+        )
+    await key("Enter")
+    return True, ""
 
 
 async def send_window_snapshot(
@@ -463,6 +585,8 @@ async def handle_interactive_ui(
 
     # Send as plain text (no markdown conversion)
     text = content.content
+    if content.name == ASK_USER_QUESTION:
+        text = f"{text}\n\n{ASK_HINT}"
 
     # Build thread kwargs for send_message
     thread_kwargs: dict[str, int] = {}

@@ -25,6 +25,79 @@ class InteractiveUIContent:
     name: str = ""  # Pattern name that matched (e.g. "AskUserQuestion")
 
 
+# Local patch: reading an AskUserQuestion screen well enough to type an answer into it
+@dataclass
+class QuestionScreen:
+    """Where things are on an AskUserQuestion screen (line numbers within its content).
+
+    ``free_line`` is the row that takes typed text ("Type something."): the last
+    numbered row before the separator above "Chat about this".  ``cursor_line`` is the
+    row the ❯ is on, wherever that is.  On the page that reviews the answers there is
+    no such row and ``review`` is set.
+    """
+
+    review: bool = False
+    multi: bool = False
+    cursor_line: int | None = None
+    free_line: int | None = None
+    free_label: str = ""  # what the row shows: the placeholder, or text already typed
+    answered: int = 0  # questions already answered (☒ on the tab line)
+
+    @property
+    def free_is_empty(self) -> bool:
+        return self.free_label.rstrip(".").strip() == "Type something"
+
+
+_Q_ROW = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(\[[ ✔xX]\]\s+)?(.*)$")
+_Q_SEPARATOR = re.compile(r"^\s*[─━]{3,}\s*$")  # shortened by extraction
+
+
+def parse_question_screen(content: str) -> QuestionScreen | None:
+    """Read an AskUserQuestion screen; None when its layout is not the known one.
+
+    Callers must not type into a screen this returns None for: with the cursor on an
+    option, letters are ignored, a digit picks that option and Enter picks the
+    highlighted one, so text sent blindly answers the question with something else.
+    """
+    lines = content.split("\n")
+    screen = QuestionScreen(answered=lines[0].count("☒") if lines else 0)
+    if any(
+        "Review your answers" in ln or "Ready to submit your answers" in ln
+        for ln in lines
+    ):
+        screen.review = True
+        return screen
+    rows: list[tuple[int, int, str, bool]] = []  # line, number, label, has checkbox
+    separator: int | None = None
+    chat: tuple[int, int] | None = None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("❯"):
+            screen.cursor_line = i
+        if _Q_SEPARATOR.match(line):
+            if rows and separator is None:
+                separator = i
+            continue
+        m = _Q_ROW.match(line)
+        if not m:
+            continue
+        if separator is None:
+            # an answered row carries a trailing ✔
+            label = m.group(4).strip().removesuffix("✔").strip()
+            rows.append((i, int(m.group(2)), label, bool(m.group(3))))
+        elif chat is None and "Chat about this" in m.group(4):
+            chat = (i, int(m.group(2)))
+    # The known layout: options numbered from 1, then the row for typed text, a
+    # separator, and "Chat about this" carrying the next number
+    if len(rows) < 2 or separator is None or chat is None:
+        return None
+    if [n for _, n, _, _ in rows] != list(range(1, len(rows) + 1)):
+        return None
+    if chat[1] != len(rows) + 1 or screen.cursor_line is None:
+        return None
+    screen.free_line, _, screen.free_label, screen.multi = rows[-1]
+    return screen
+
+
 @dataclass(frozen=True)
 class UIPattern:
     """A text-marker pair that delimits an interactive UI region.

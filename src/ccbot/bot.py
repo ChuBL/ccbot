@@ -115,15 +115,19 @@ from .handlers.file_sender import outbox_poll_loop, send_file_command
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
+    ASK_USER_QUESTION,
     TRUST_DIALOG,
+    answer_question_with_text,
     answer_trust_dialog,
     clear_interactive_mode,
     clear_interactive_msg,
+    confirm_esc,
     expect_ready,
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
     open_background_session,
+    question_on_screen,
     send_window_snapshot,
     set_interactive_mode,
 )
@@ -1077,6 +1081,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     "Not sent: answer the trust prompt first, with the buttons above.",
                 )
                 return
+            # Local patch: on a question the text is the answer, typed into its own
+            # row. Sent as plain keys it would be dropped and Enter would pick an option.
+            if content and content.name == ASK_USER_QUESTION:
+                ok, note = await answer_question_with_text(wid, text)
+                if note:
+                    await safe_reply(update.message, note)
+                await asyncio.sleep(0.5)
+                await handle_interactive_ui(context.bot, user.id, wid, thread_id)
+                return
             # Small delay to let UI render in Telegram before text arrives
             await asyncio.sleep(0.3)
     except Exception as e:
@@ -1791,6 +1804,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         window_id = data[len(CB_ASK_ESC) :]
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
+        # Local patch: on a question Esc discards every answer, so it takes two presses
+        if (
+            w
+            and await question_on_screen(w.window_id)
+            and not confirm_esc(user.id, w.window_id)
+        ):
+            logger.info("Esc on a question in %s held for a second press", window_id)
+            await query.answer(
+                "Esc cancels every question, including the ones already answered.\n\n"
+                "To answer in your own words, just send them as a message.\n\n"
+                "Press Esc again within 15 seconds to cancel anyway.",
+                show_alert=True,
+            )
+            return
         if w:
             await tmux_manager.send_keys(
                 w.window_id, "Escape", enter=False, literal=False
