@@ -134,9 +134,10 @@ from .handlers.interactive_ui import (
 from .handlers.message_queue import (
     clear_status_msg_info,
     enqueue_content_message,
-    delete_status_messages,
     enqueue_status_update,
     get_message_queue,
+    load_status_messages,
+    save_status_messages,
     shutdown_workers,
 )
 from .handlers.message_sender import (
@@ -2032,6 +2033,7 @@ async def handle_session_started(
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task, _outbox_poll_task
 
+    load_status_messages()
     await application.bot.delete_my_commands()
 
     bot_commands = [
@@ -2114,7 +2116,9 @@ async def post_stop(application: Application) -> None:
     # Stop all queue workers
     await shutdown_workers()
 
-    await delete_status_messages(application.bot)
+    # Local patch: the status messages stay in their topics and are taken up again
+    # on start; deleting them here meant a new one in every topic after each restart
+    save_status_messages()
 
 
 async def post_shutdown(application: Application) -> None:

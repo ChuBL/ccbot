@@ -18,6 +18,7 @@ Key components:
 """
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..terminal_parser import parse_custom_statusline, parse_status_line
 from ..tmux_manager import tmux_manager
+from ..utils import atomic_write_json
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
@@ -94,6 +96,49 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
+
+# Local patch: the status messages are remembered across a restart. They used to be
+# deleted on stop and sent again on start, which put a new message in every topic
+# each time the bot was restarted.
+STATUS_MSGS_FILE = "status_msgs.json"
+
+
+def save_status_messages() -> None:
+    """Write down which message is each topic's status message."""
+    rows = [
+        {"user": u, "thread": t, "msg": m, "window": w, "text": text}
+        for (u, t), (m, w, text) in _status_msg_info.items()
+    ]
+    try:
+        atomic_write_json(config.config_dir / STATUS_MSGS_FILE, rows)
+    except (OSError, TypeError, ValueError) as e:
+        logger.warning("Could not save the status messages: %s", e)
+
+
+def load_status_messages() -> int:
+    """Take up the status messages an earlier run left in the topics.
+
+    The next status update edits them in place, or leaves them alone when the
+    text has not changed. One that was deleted meanwhile fails to edit and is
+    sent again, as before.
+    """
+    try:
+        rows = json.loads((config.config_dir / STATUS_MSGS_FILE).read_text())
+    except (OSError, ValueError):
+        return 0
+    for row in rows if isinstance(rows, list) else []:
+        try:
+            key = (int(row["user"]), int(row["thread"]))
+            _status_msg_info.setdefault(
+                key, (int(row["msg"]), str(row["window"]), str(row["text"]))
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    logger.info(
+        "Took up %d status message(s) from before the restart", len(_status_msg_info)
+    )
+    return len(_status_msg_info)
+
 
 # After a status message failed to send, when the next one may be sent
 # (time.monotonic()). A send that timed out may have been delivered without us
@@ -563,6 +608,11 @@ async def _process_status_update_task(
                     # next poll, instead of sending a new one each time.
                     logger.debug(f"Status message edit deferred: {e}")
                     return
+                if "not modified" in str(e).lower():
+                    # It already shows this (the text on record was older, as
+                    # after a restart that was not a clean stop)
+                    _status_msg_info[skey] = (msg_id, wid, status_text)
+                    return
                 try:
                     await bot.edit_message_text(
                         chat_id=chat_id,
@@ -625,6 +675,7 @@ async def _do_send_status_message(
     if sent:
         _status_msg_info[skey] = (sent.message_id, window_id, text)
         _status_send_retry_at.pop(skey, None)
+        save_status_messages()
     else:
         _status_send_retry_at[skey] = time.monotonic() + STATUS_SEND_RETRY_SECONDS
 

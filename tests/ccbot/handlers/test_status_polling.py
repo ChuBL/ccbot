@@ -278,14 +278,50 @@ class TestStatuslineMessage:
         assert send.await_args.kwargs["disable_notification"] is silent
         message_queue._status_msg_info.clear()
 
-    async def test_status_messages_are_removed_on_stop(self) -> None:
+    async def test_status_messages_survive_a_restart(self, tmp_path) -> None:
+        """Kept on stop and taken up on start: no new message in each topic."""
         bot = AsyncMock()
+        message_queue._status_msg_info.clear()
         message_queue._status_msg_info[(1, 7)] = (99, "@1", "`bar`")
+        with patch("ccbot.handlers.message_queue.config") as cfg:
+            cfg.config_dir = tmp_path
+            message_queue.save_status_messages()
+            message_queue._status_msg_info.clear()  # the restart
+            assert message_queue.load_status_messages() == 1
+        assert message_queue._status_msg_info[(1, 7)] == (99, "@1", "`bar`")
         with patch("ccbot.handlers.message_queue.session_manager") as sm:
             sm.resolve_chat_id.return_value = 1
-            await message_queue.delete_status_messages(bot)
-        bot.delete_message.assert_awaited_once_with(chat_id=1, message_id=99)
-        assert not message_queue._status_msg_info
+            task = message_queue.MessageTask(
+                task_type="status_update", text="`bar`", window_id="@1", thread_id=7
+            )
+            await message_queue._process_status_update_task(bot, 1, task)
+        bot.send_message.assert_not_awaited()
+        bot.edit_message_text.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+        message_queue._status_msg_info.clear()
+
+    async def test_an_unchanged_message_is_not_sent_again(self) -> None:
+        """The text on record can be older than what the message shows."""
+        from telegram.error import BadRequest
+
+        bot = AsyncMock()
+        bot.edit_message_text.side_effect = BadRequest("Message is not modified")
+        message_queue._status_msg_info.clear()
+        message_queue._status_msg_info[(1, 7)] = (99, "@1", "`old`")
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback", new=AsyncMock()
+            ) as send,
+        ):
+            sm.resolve_chat_id.return_value = 1
+            task = message_queue.MessageTask(
+                task_type="status_update", text="`new`", window_id="@1", thread_id=7
+            )
+            await message_queue._process_status_update_task(bot, 1, task)
+        send.assert_not_awaited()
+        assert message_queue._status_msg_info[(1, 7)] == (99, "@1", "`new`")
+        message_queue._status_msg_info.clear()
 
 
 class TestStatusMessageDuringTelegramOutage:
